@@ -71,14 +71,13 @@ print(f"[INFO] Embedding dimension: {dim}", flush=True)
 store = zarr.open(OUTPUT_FILE, mode="w")
 
 # ids array: maps position → question id
-ids_arr = store.open_array("ids", mode="w", shape=(N,), dtype="int64", chunks=(BATCH_SIZE,))
+ids_arr = store.zeros(name="ids", shape=(N,), dtype="int64", chunks=(BATCH_SIZE,))
 ids_arr[:] = np.array(sorted_ids, dtype=np.int64)
 
 # texts array: variable-length UTF-8 strings, same ordering as ids
 # zarr v3 uses dtype="str" for variable-length UTF-8 strings natively
-texts_arr = store.open_array(
-    "texts",
-    mode="w",
+texts_arr = store.create_array(
+    name="texts",
     shape=(N,),
     dtype="str",
     chunks=(BATCH_SIZE,),
@@ -86,9 +85,8 @@ texts_arr = store.open_array(
 texts_arr[:] = sorted_texts
 
 # embeddings array: shape (N, dim), chunked so each row is one question embedding
-emb_arr = store.open_array(
-    "embeddings",
-    mode="w",
+emb_arr = store.zeros(
+    name="embeddings",
     shape=(N, dim),
     dtype="float32",
     chunks=(BATCH_SIZE, dim),
