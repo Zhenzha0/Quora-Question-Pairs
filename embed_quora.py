@@ -1,8 +1,8 @@
 import time
+import kagglehub
 import numpy as np
 import zarr
 from sentence_transformers import SentenceTransformer
-from datasets import load_dataset
 
 # Config
 MODEL_NAME = "Qwen/Qwen3-Embedding-4B"
@@ -23,14 +23,32 @@ def format_duration(seconds: float) -> str:
 
 # Load dataset and collect unique questions by their question ID
 print("[INFO] Loading dataset...", flush=True)
-dataset = load_dataset("quora", split="train")
+path = kagglehub.dataset_download("quora/question-pairs-dataset")
+print("Path to dataset files:", path)
 
-# Each row has questions: {"id": [id1, id2], "text": [text1, text2]}
+import os, csv
+
+# Find the CSV file in the downloaded path
+csv_file = os.path.join(path, "questions.csv")
+if not os.path.exists(csv_file):
+    # Fallback: find any CSV in the directory
+    for fname in os.listdir(path):
+        if fname.endswith(".csv"):
+            csv_file = os.path.join(path, fname)
+            break
+
 id_to_text: dict[int, str] = {}
-for pair in dataset["questions"]:
-    for qid, text in zip(pair["id"], pair["text"]):
-        if qid not in id_to_text:
-            id_to_text[qid] = text
+with open(csv_file, newline="", encoding="utf-8") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        for id_col, text_col in [("qid1", "question1"), ("qid2", "question2")]:
+            try:
+                qid = int(row[id_col])
+                text = row[text_col]
+                if qid not in id_to_text:
+                    id_to_text[qid] = text
+            except (KeyError, ValueError):
+                pass
 
 # Sort by question ID for deterministic ordering
 sorted_ids = sorted(id_to_text.keys())
