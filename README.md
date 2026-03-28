@@ -31,10 +31,23 @@ The pre-computed `embeddings.zarr` store (~3.7 GB, 18 k files) is tracked with D
 
 ```bash
 # Place the provided .dvc/config (and credentials) in the repo, then:
-dvc pull
+uv run dvc pull
 ```
 
 This pulls `embeddings.zarr` from the configured remote. There is no need to re-run `embed_quora.py` unless you want to regenerate the embeddings.
+
+### Quick start — just get the data
+
+If you only want to pull the embeddings without setting up the full Python environment, you can use `uv run` which handles the virtualenv automatically. After cloning the repo, simply:
+
+1. Place the provided `.dvc/config` and `.dvc/config.local` (credentials) files into the `.dvc/` directory.
+2. Run:
+
+```bash
+uv run dvc pull embeddings.zarr
+```
+
+`uv` will install DVC into an isolated environment on first run. Once the pull finishes, `embeddings.zarr/` will be present and ready to use.
 
 ### Zarr store layout
 
@@ -65,7 +78,7 @@ https://www.comp.nus.edu.sg/~cs3210/student-guide/accessing/
 
 But the basic sequence of events are:
 1. Create a SOC account from https://mysoc.nus.edu.sg/~newacct
-2. Turn on 
+2. Turn on The SOC Compute Cluster here: https://mysoc.nus.edu.sg/~myacct/services.cgi
 3. Get the Forticlient VPN and connect to it
 4. ssh into the cluster (the password is the password you created for the SOC account)
 ```bash
@@ -84,7 +97,7 @@ uv sync
 Pull the embeddings with DVC (place the provided config files first):
 
 ```bash
-dvc pull
+uv run dvc pull
 ```
 
 Submit the embedding job (H200 GPU, 64 GB RAM, 2 h wall time):

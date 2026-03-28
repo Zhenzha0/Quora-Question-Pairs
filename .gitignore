@@ -5,5 +5,5 @@ __pycache__/
 *.log
 *.err
 embeddings.zarr
-.dvc/config
+.dvc/*
 .venv
