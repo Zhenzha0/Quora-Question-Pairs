@@ -1,0 +1,6 @@
+outs:
+- md5: 2928fc5071db252a913ada6b4545a017.dir
+  size: 3706482607
+  nfiles: 18517
+  hash: md5
+  path: embeddings.zarr

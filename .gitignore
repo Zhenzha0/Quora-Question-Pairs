@@ -1,1 +1,9 @@
 data/
+.env
+*.pem
+__pycache__/
+*.log
+*.err
+embeddings.zarr
+.dvc/config
+.venv

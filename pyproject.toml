@@ -5,9 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "dvc>=3.67.0",
+    "dvc[s3]>=3.67.0",
     "kagglehub>=1.0.0",
     "numpy>=2.0.0",
+    "python-dotenv>=1.2.2",
     "sentence-transformers>=3.0.0",
     "torch>=2.0.0",
     "transformers>=4.51.0",
