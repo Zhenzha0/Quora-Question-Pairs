@@ -34,7 +34,7 @@ uv run <script_name.py>
 ---
 
 ## Getting the Embeddings (DVC)
-
+    
 > **What is DVC?**
 > DVC (Data Version Control) is like Git, but for large data files. Git isn't suited for storing gigabytes of binary data, so instead DVC stores a small pointer file (`embeddings.zarr.dvc`) in the repo and keeps the actual data on a separate remote storage (e.g. S3). Running `dvc pull` downloads the real data from that remote. This keeps the repo lightweight while still letting everyone reproduce the exact same data.
 
