@@ -48,7 +48,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from data import load_pairs
 from report import generate_report
-from models import CatBoostModel, CosineBaseline, LogRegModel, XGBoostModel, RandomForestModel, RandomForestTopKModel
+from models import CatBoostModel, CosineBaseline, LogRegModel, XGBoostModel, RandomForestModel, RandomForestTopKModel, GRUModel
 
 # ---------------------------------------------------------------------------
 # Registry — maps CLI --model name → model instance
@@ -60,7 +60,8 @@ MODEL_REGISTRY: dict[str, object] = {
     "logreg":   LogRegModel(),
     "cosine":   CosineBaseline(),
     "randforest": RandomForestModel(),
-    "randforesttopk": RandomForestTopKModel()
+    "randforesttopk": RandomForestTopKModel(),
+    "gru": GRUModel(),
 }
 
 # ---------------------------------------------------------------------------
