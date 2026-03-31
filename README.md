@@ -145,26 +145,6 @@ logs/embed_quora_12345.log
 logs/embed_quora_12345.err
 ```
 
-### Publishing experiment results after a job finishes
-
-Once your Slurm job has finished and written outputs under `experiments/results/`, publish the **entire shared results snapshot** from the repo root:
-
-```bash
-./publish_results.sh "Publish catboost_matryoshka_all_features"
-```
-
-`publish_results.sh` is snapshot-based, not per-experiment. It:
-- backs up your current local `experiments/results/`
-- pulls the latest Git commit and DVC version of `experiments/results`
-- merges your local finished results back over that pulled tree, so **your local files win on overlap**
-- re-runs `dvc add experiments/results`
-- `dvc push`es the updated data
-- commits the updated `experiments/results.dvc` pointer and pushes it to Git
-
-This is the important final step for collaboration: **`dvc push` alone is not enough**. Other people only see the new shared results after the updated `experiments/results.dvc` file is committed and pushed.
-
-For safety, the script expects a clean Git working tree for tracked files before it runs. If you still have local edits to code or docs, commit or stash them first.
-
 ### Calling sbatch directly (advanced)
 
 If you prefer to call `sbatch` manually, `%x` in the output path resolves to the job name, so you'll want to set `--job-name` yourself:
@@ -206,7 +186,7 @@ You should be doing them through SLURM with the submit.sh script, but if you wan
 cd experiments
 uv run python run_experiment.py --model catboost --name catboost_matryoshka_all_features
 
-# Optional: upload current DVC objects after a successful run
+# Optional: auto-push tracked experiment artifacts after a successful run
 uv run python run_experiment.py --model catboost --name catboost_matryoshka_all_features --dvc-push
 ```
 
@@ -214,7 +194,7 @@ Available `--model` values: `xgboost`, `catboost`, `logreg`, `cosine`
 
 For quick smoke-tests, add `--max-rows 50000`. Other useful flags: `--threshold`, `--test-size`, `--zarr`, `--split-file`, `--results-dir`. See `experiments/README.md` for the full flag reference.
 
-`--dvc-push` is opt-in so collaborators without DVC write credentials can still run experiments normally. It only uploads DVC objects; to actually publish the updated shared snapshot to collaborators, run `./publish_results.sh` afterwards from the repo root.
+`--dvc-push` is opt-in so collaborators without DVC write credentials can still run experiments normally.
 
 ### Report output
 
