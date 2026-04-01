@@ -50,7 +50,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from data import load_pairs
 from report import generate_report
-from models import CatBoostModel, CosineBaseline, LogRegModel, XGBoostModel, RandomForestModel, RandomForestTopKModel, GRUModel, GRUModelV2, GRUModelV3
+from models import CatBoostModel, CosineBaseline, EnsembleModel, LogRegModel, XGBoostModel, RandomForestModel, RandomForestTopKModel, GRUModel, GRUModelV2, GRUModelV3
 
 # ---------------------------------------------------------------------------
 # Registry — maps CLI --model name → model instance
@@ -66,6 +66,35 @@ MODEL_REGISTRY: dict[str, object] = {
     "gru":    GRUModel(),
     "gru_v2": GRUModelV2(),
     "gru_v3": GRUModelV3(),
+    # ------------------------------------------------------------------
+    # Ensemble models
+    # ------------------------------------------------------------------
+    # Simple unweighted average of XGBoost + CatBoost + GRU v3 probabilities.
+    # Fast to run; good sanity-check that the members are complementary.
+    "ensemble_mean": EnsembleModel(
+        members=[XGBoostModel(), CatBoostModel(), GRUModelV3()],
+        strategy="mean",
+    ),
+    # Weighted average that up-weights the two tree models (empirically
+    # stronger on this dataset) relative to the GRU.
+    "ensemble_mean_weighted": EnsembleModel(
+        members=[XGBoostModel(), CatBoostModel(), GRUModelV3()],
+        strategy="mean",
+        weights=[2.0, 2.0, 1.0],
+    ),
+    # Full stacking: OOF LogReg meta-learner learns optimal combination.
+    # XGBoost and GRU v3 are complementary (matryoshka stats vs raw sequences),
+    # so stacking is likely to outperform either simple average.
+    "ensemble_stack": EnsembleModel(
+        members=[XGBoostModel(), CatBoostModel(), GRUModelV3()],
+        strategy="stacking",
+        meta_folds=5,
+    ),
+    # Tree-only mean ensemble — quick ablation without the slower GRU.
+    "ensemble_trees_mean": EnsembleModel(
+        members=[XGBoostModel(), CatBoostModel(), RandomForestModel()],
+        strategy="mean",
+    ),
 }
 
 # ---------------------------------------------------------------------------

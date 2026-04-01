@@ -189,8 +189,27 @@ _DEFAULTS: dict = dict(
     lr_patience    = 4,       # LR patience (was 2)
     grad_clip      = 1.0,
     val_frac       = 0.05,    # smaller val split (was 0.10)
-    max_pos_weight = 1.3,     # cap on class reweighting (was uncapped at ~1.7)
-    threshold      = 0.5,
+    # Recall-oriented tuning
+    # ─────────────────────────────────────────────────────────────────
+    # In a question-deduplication UI it is worse to *miss* a duplicate
+    # (the user never sees a related question exists) than to show a
+    # borderline false positive (the user simply ignores it).  We
+    # therefore make two recall-friendly adjustments:
+    #
+    #   max_pos_weight = 2.0  — restore the full natural class-imbalance
+    #                           correction (~1.7×) and push slightly
+    #                           beyond it.  The training loss now penalises
+    #                           missed duplicates (FN) more heavily than
+    #                           false alarms (FP).
+    #
+    #   threshold = 0.42      — at inference the model must only be 42 %
+    #                           confident a pair is duplicate to call it
+    #                           so.  Shifting the operating point left on
+    #                           the ROC curve trades a small precision drop
+    #                           for a meaningful recall gain without any
+    #                           retraining.
+    max_pos_weight = 2.0,     # was 1.3; fully corrects + slightly boosts recall
+    threshold      = 0.42,    # was 0.5; lower cut-off → more duplicates surfaced
     seed           = 42,
 )
 

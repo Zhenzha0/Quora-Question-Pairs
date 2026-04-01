@@ -2,6 +2,7 @@
 
 from .catboost_model import CatBoostModel
 from .cosine_baseline import CosineBaseline
+from .ensemble_model import EnsembleModel
 from .logreg_model import LogRegModel
 from .xgboost_model import XGBoostModel
 from .randomforest_model import RandomForestModel
@@ -13,6 +14,7 @@ from .gru_model_v3 import GRUModelV3
 __all__ = [
     "CatBoostModel",
     "CosineBaseline",
+    "EnsembleModel",
     "LogRegModel",
     "XGBoostModel",
     "RandomForestModel",
