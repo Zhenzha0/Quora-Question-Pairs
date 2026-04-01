@@ -1,10 +1,14 @@
 import time
+import os
+import csv
+
+from dotenv import load_dotenv
+load_dotenv()  # loads KAGGLE_USERNAME and KAGGLE_KEY from .env
+
 import kagglehub
 import numpy as np
 import zarr
 from sentence_transformers import SentenceTransformer
-import os
-import csv 
 
 # Config
 MODEL_NAME = "Qwen/Qwen3-Embedding-4B"

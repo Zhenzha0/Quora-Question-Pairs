@@ -72,6 +72,9 @@ import time
 from datetime import datetime
 from typing import NamedTuple
 
+from dotenv import load_dotenv
+load_dotenv()  # loads KAGGLE_USERNAME and KAGGLE_KEY from .env
+
 import numpy as np
 import zarr
 

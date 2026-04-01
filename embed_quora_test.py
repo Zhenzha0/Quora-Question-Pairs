@@ -31,6 +31,9 @@ import csv
 import os
 import time
 
+from dotenv import load_dotenv
+load_dotenv()  # loads KAGGLE_USERNAME and KAGGLE_KEY from .env
+
 import kagglehub
 import numpy as np
 import zarr
