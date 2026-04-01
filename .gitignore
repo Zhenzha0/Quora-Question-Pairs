@@ -8,6 +8,9 @@ logs/
 *.log
 *.err
 embeddings.zarr
+test_embeddings.zarr
+# kaggle submission outputs
+submissions/
 .dvc/*
 !.dvc/config
 .venv

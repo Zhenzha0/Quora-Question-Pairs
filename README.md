@@ -71,8 +71,10 @@ Look up a question by ID with `np.searchsorted(store["ids"], qid)`.
 
 | Script | What it does |
 |--------|-------------|
-| `embed_quora.py` | Downloads the Quora dataset via `kagglehub`, embeds every unique question with Qwen3-Embedding-4B (SDPA, batches of 128), and writes the result to `embeddings.zarr`. Logs progress every 30 s. |
-| `experiments/run_experiment.py` | **New entry point.** Plug-and-play experiment runner — see the [Experiment Harness](#experiment-harness) section below. |
+| `embed_quora.py` | Downloads the Quora **training** dataset, embeds every unique question with Qwen3-Embedding-4B (SDPA, batches of 128), and writes the result to `embeddings.zarr`. |
+| `embed_quora_test.py` | Downloads the Kaggle **competition test** data, embeds every unique question, and writes to `test_embeddings.zarr`. Run this before `kaggle_submit.py`. Requires Kaggle credentials. |
+| `kaggle_submit.py` | Trains the chosen model on **all** training pairs, predicts on the competition test set, and writes `submissions/<name>/submission.csv` ready to upload to Kaggle. |
+| `experiments/run_experiment.py` | Plug-and-play experiment runner (local evaluation with train/test split) — see the [Experiment Harness](#experiment-harness) section below. |
 
 ---
 
@@ -256,25 +258,125 @@ Add a function to `features.py` that takes a `PairRecord` and returns `dict[str,
 
 ---
 
+## Generating a Kaggle Submission
+
+The standard experiment pipeline (`run_experiment.py`) holds out 20 % of training data for local evaluation.  For an actual Kaggle submission you want to train on **every labelled pair** and predict on the competition's unlabelled test set.  Two new scripts handle this end-to-end.
+
+### Step-by-step
+
+#### 1 — Set up Kaggle credentials
+
+The competition test data is downloaded via `kagglehub`, which needs your Kaggle API token.
+
+```bash
+# Option A: file  (recommended)
+mkdir -p ~/.kaggle
+echo '{"username":"YOUR_USERNAME","key":"YOUR_API_KEY"}' > ~/.kaggle/kaggle.json
+chmod 600 ~/.kaggle/kaggle.json
+
+# Option B: environment variables
+export KAGGLE_USERNAME=YOUR_USERNAME
+export KAGGLE_KEY=YOUR_API_KEY
+```
+
+Your API key is at https://www.kaggle.com/settings → "Create New Token".
+
+#### 2 — Embed the test questions  (`embed_quora_test.py`)
+
+The competition `test.csv` contains ~2.3 M question pairs whose questions are **not** in the training zarr store.  This script downloads `test.csv`, extracts every unique question text, embeds them with Qwen3-Embedding-4B, and saves to `test_embeddings.zarr`.
+
+```bash
+# GPU job (strongly recommended — ~1M+ unique questions to embed)
+./submit.sh gpu embed_quora_test.py
+
+# With a custom batch size or output path:
+./submit.sh gpu embed_quora_test.py --batch-size 64 --output test_embeddings.zarr
+```
+
+The output zarr store layout:
+
+| Array | Shape | dtype | Description |
+|-------|-------|-------|-------------|
+| `texts` | `(N,)` | str | Unique question texts, **sorted alphabetically** |
+| `embeddings` | `(N, 2560)` | float32 | Qwen3-Embedding-4B vectors |
+
+Look up a question by text:
+```python
+import zarr, numpy as np
+store    = zarr.open("test_embeddings.zarr", mode="r")
+texts    = store["texts"][:]
+text2pos = {t: i for i, t in enumerate(texts)}
+pos      = text2pos["What is the capital of France?"]
+emb      = store["embeddings"][pos]
+```
+
+#### 3 — Train and submit  (`kaggle_submit.py`)
+
+Trains the chosen model on **all** training pairs (no held-out split), predicts on the full test set, and writes a `submissions/<name>/submission.csv` that you upload directly to Kaggle.
+
+```bash
+# Best ensemble — unweighted mean of XGBoost + CatBoost + GRU v3
+./submit.sh cpu kaggle_submit.py --model ensemble_mean --name ensemble_mean_v1
+
+# Stacking ensemble (OOF LogReg meta-learner)
+./submit.sh cpu kaggle_submit.py --model ensemble_stack --name ensemble_stack_v1
+
+# Weighted ensemble (up-weights tree models 2× vs GRU)
+./submit.sh cpu kaggle_submit.py --model ensemble_mean_weighted --name ensemble_weighted_v1
+
+# Single model (fast sanity-check)
+./submit.sh cpu kaggle_submit.py --model catboost --name catboost_v1
+
+# Smoke-test with fewer training rows
+./submit.sh cpu kaggle_submit.py --model ensemble_mean --name smoke --max-train-rows 50000
+```
+
+Available `--model` values: `xgboost`, `catboost`, `logreg`, `cosine`,
+`randforest`, `randforesttopk`, `gru`, `gru_v2`, `gru_v3`,
+`ensemble_mean`, `ensemble_mean_weighted`, `ensemble_stack`, `ensemble_trees_mean`
+
+#### Output
+
+```
+submissions/
+└── <name>/
+    ├── submission.csv   ← upload this to Kaggle (test_id, is_duplicate probability)
+    └── config.json      ← full reproducibility record (model, zarr paths, row counts, …)
+```
+
+> **Note on `is_duplicate`:** Kaggle scores this competition with **log-loss**, which requires *probabilities* (floats 0–1), not binary predictions.  `kaggle_submit.py` always writes raw `predict_proba()` output — never hard labels.
+
+#### How the "combined-records stub trick" works
+
+`EnsembleModel` stores each base model's full feature matrix internally and uses stub row-indices to route samples.  `kaggle_submit.py` exploits this by concatenating `train_records + test_records` before calling `build_features`, so the stub indices 0…N_train−1 are naturally the training rows and N_train…N_total−1 are the test rows.  `fit()` sees only the training slice; `predict_proba()` sees only the test slice — no changes to any model code required.
+
+---
+
 ## Project Structure
 
 ```
 .
-├── embed_quora.py              # Step 1: embed all questions → embeddings.zarr
-├── catboost_thresh.py          # (Legacy) monolithic classifier script
+├── embed_quora.py              # Step 1a: embed training questions → embeddings.zarr
+├── embed_quora_test.py         # Step 1b: embed competition test questions → test_embeddings.zarr
+├── kaggle_submit.py            # Step 3: train on all data → submissions/<name>/submission.csv
 ├── experiments/
-│   ├── run_experiment.py       # Step 2: entry point for all model experiments
+│   ├── run_experiment.py       # Step 2: entry point for local evaluation experiments
 │   ├── data.py                 # Shared loader: zarr + CSV → list[PairRecord]
 │   ├── features.py             # Primitive feature functions (embedding, lexical)
 │   ├── report.py               # Metrics printer + results writer
 │   ├── models/
+│   │   ├── ensemble_model.py   # Ensemble / stacking wrapper
 │   │   ├── catboost_model.py
+│   │   ├── xgboost_model.py
+│   │   ├── gru_model_v3.py
 │   │   ├── logreg_model.py
 │   │   ├── cosine_baseline.py
-│   │   └── xgboost_model.py
+│   │   └── ...
 │   ├── splits/                 # Auto-created; holds the fixed train/test split
 │   └── results/                # Auto-created; one subfolder per experiment run
-├── embeddings.zarr.dvc         # DVC pointer to the Zarr store
+├── embeddings.zarr.dvc         # DVC pointer to the training zarr store
+├── test_embeddings.zarr        # Auto-created by embed_quora_test.py (gitignored)
+├── submissions/                # Auto-created by kaggle_submit.py (gitignored)
 ├── slurm_gpu.sh                # Slurm job script for GPU tasks (e.g. embedding)
 ├── slurm_cpu.sh                # Slurm job script for CPU-only tasks (e.g. classifiers)
 ├── submit.sh                   # Convenience wrapper: auto-names logs and routes to logs/
