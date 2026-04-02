@@ -1,0 +1,6 @@
+outs:
+- md5: 38912d9b0ff43b5d3a03e6c790880d81.dir
+  size: 20424833570
+  nfiles: 68187
+  hash: md5
+  path: test_embeddings.zarr
