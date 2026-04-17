@@ -14,8 +14,9 @@ Optional flags:
     --max-rows   INT    Subsample the dataset (e.g. 50000 for smoke-tests)
     --test-size  FLOAT  Fraction held out for testing (default: 0.20)
     --threshold  FLOAT  Decision threshold (default: model's own, else 0.5)
-    --tune              Force hyperparameter tuning when supported by model
-    --no-tune           Skip hyperparameter tuning even if model supports it
+    --tune-random       Run RandomizedSearchCV tuning when supported by model
+    --tune-optuna       Run OptunaSearchCV tuning when supported by model
+    --no-tune           Skip hyperparameter tuning
     --zarr              PATH   Path to embeddings.zarr (default: ../embeddings.zarr)
     --cross-encoder-zarr PATH  Path to cross_encoder_scores.zarr (default: ../cross_encoder_scores.zarr)
     --split-file PATH   Path to .npz split file (default: splits/default_split.npz)
@@ -142,18 +143,27 @@ def parse_args() -> argparse.Namespace:
     )
     tune_group = parser.add_mutually_exclusive_group()
     tune_group.add_argument(
-        "--tune",
-        dest="tune",
-        action="store_true",
-        help="Run hyperparameter tuning (if model supports tune()).",
+        "--tune-random",
+        dest="tune_mode",
+        action="store_const",
+        const="random",
+        help="Run RandomizedSearchCV tuning (if model supports tune()).",
+    )
+    tune_group.add_argument(
+        "--tune-optuna",
+        dest="tune_mode",
+        action="store_const",
+        const="optuna",
+        help="Run OptunaSearchCV tuning (if model supports tune_optuna()).",
     )
     tune_group.add_argument(
         "--no-tune",
-        dest="tune",
-        action="store_false",
+        dest="tune_mode",
+        action="store_const",
+        const="none",
         help="Skip hyperparameter tuning.",
     )
-    parser.set_defaults(tune=None)
+    parser.set_defaults(tune_mode="none")
     parser.add_argument(
         "--zarr",
         default=None,
@@ -328,24 +338,26 @@ def run(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     print(f"\n[run] Fitting model...", flush=True)
     t_fit = time.time()
-    model_supports_tune = hasattr(model, "tune")
-    if args.tune is None:
-        do_tune = model_supports_tune
-    else:
-        do_tune = bool(args.tune)
-
-    if do_tune and not model_supports_tune:
-        print(
-            f"[run] Tuning requested but {getattr(model, 'name', type(model).__name__)} "
-            "does not implement tune(); continuing without tuning.",
-            flush=True,
-        )
-        do_tune = False
-
-    if do_tune:
-        print("[run] Hyperparameter tuning enabled.", flush=True)
-        model.tune(X_train, y_train)
-        model.tune_optuna(X_train, y_train)
+    if args.tune_mode == "random":
+        if hasattr(model, "tune"):
+            print("[run] Hyperparameter tuning enabled (RandomizedSearchCV).", flush=True)
+            model.tune(X_train, y_train)
+        else:
+            print(
+                f"[run] RandomizedSearchCV tuning requested but {getattr(model, 'name', type(model).__name__)} "
+                "does not implement tune(); continuing without tuning.",
+                flush=True,
+            )
+    elif args.tune_mode == "optuna":
+        if hasattr(model, "tune_optuna"):
+            print("[run] Hyperparameter tuning enabled (OptunaSearchCV).", flush=True)
+            model.tune_optuna(X_train, y_train)
+        else:
+            print(
+                f"[run] OptunaSearchCV tuning requested but {getattr(model, 'name', type(model).__name__)} "
+                "does not implement tune_optuna(); continuing without tuning.",
+                flush=True,
+            )
     else:
         print("[run] Hyperparameter tuning skipped.", flush=True)
 
@@ -367,7 +379,7 @@ def run(args: argparse.Namespace) -> None:
         "max_rows":    args.max_rows,
         "test_size":   args.test_size,
         "threshold":   args.threshold,
-        "tune":        args.tune,
+        "tune_mode":   args.tune_mode,
         "zarr":               zarr_path,
         "cross_encoder_zarr": cross_enc_path,
         "split_file":         split_file,
