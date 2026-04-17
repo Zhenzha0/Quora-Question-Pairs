@@ -24,6 +24,8 @@ from hyperparameter_tuning import OptunaSearchCV
 
 _DEFAULTS = dict(
     n_estimators=700,
+    early_stopping_rounds=50,
+    min_child_weight=1,
     max_depth=8,
     learning_rate=0.05,
     subsample=0.9,
@@ -36,11 +38,13 @@ _DEFAULTS = dict(
     n_jobs=-1,
 )
 
-param_space = {'max_depth': {'type': 'int', 'low': 3, 'high': 10},
+param_space = {'max_depth': {'type': 'int', 'low': 3, 'high': 12},
+               'min_child_weight': {'type': 'int', 'low': 1, 'high': 10},
                'learning_rate': {'type': 'float', 'low': 0.01, 'high': 0.3, 'log': True},
+                'n_estimators': {'type': 'int', 'low': 100, 'high': 1000},
                'subsample': {'type': 'float', 'low': 0.5, 'high': 1.0}, #prevents overfitting by sampling a fraction of training data
                'colsample_bytree': {'type': 'float', 'low': 0.5, 'high': 1.0}, #prevents overfitting by sampling a fraction of features
-               'reg_lambda': {'type': 'float', 'low': 1e-3, 'high': 100.0, 'log': True} #regularisation strength (L2)
+               'reg_lambda': {'type': 'float', 'low': 1e-2, 'high': 100.0, 'log': True} #regularisation strength (L2)
                }
 
 
@@ -91,7 +95,7 @@ class XGBoostModel:
         tuner = RandomizedSearchCV(
             estimator=XGBClassifier(**_DEFAULTS),
             param_distributions=param_space,
-            n_iter=20,
+            n_iter=25,
             cv=5,
             scoring="f1",
             random_state=42,

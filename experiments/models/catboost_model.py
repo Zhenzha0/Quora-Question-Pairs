@@ -132,8 +132,8 @@ class CatBoostModel:
             n_trials=20,
             cv=5,
             scoring="f1",
-            random_state=42,
-        )
+            random_state=42
+            )
         tuner.fit(X, y)
         best_params = tuner.get_best_params()
         best_score = tuner.get_best_score()
