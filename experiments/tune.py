@@ -71,7 +71,7 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 sys.path.insert(0, os.path.dirname(__file__))
 
 from data import load_pairs
-from models import CatBoostModel, XGBoostModel
+from models import CatBoostModel, XGBoostModel, XGBoostClassicalModel
 
 # ---------------------------------------------------------------------------
 # Registry — maps CLI --model name → model class that implements
@@ -79,8 +79,9 @@ from models import CatBoostModel, XGBoostModel
 # ---------------------------------------------------------------------------
 
 TUNING_REGISTRY: dict[str, type] = {
-    "xgboost":  XGBoostModel,
-    "catboost": CatBoostModel,
+    "xgboost":           XGBoostModel,
+    "catboost":          CatBoostModel,
+    "xgboost_classical": XGBoostClassicalModel,
 }
 
 
