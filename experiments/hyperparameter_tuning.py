@@ -355,7 +355,21 @@ class OptunaSearchCV:
         self.best_model = clone(self.estimator)
         self.best_model.set_params(**self.best_params)
 
-        self.best_model.fit(X, y)
+        try:
+            self.best_model.fit(X, y)
+        except ValueError as exc:
+            message = str(exc)
+            if "validation dataset" not in message and "early stopping" not in message:
+                raise
+
+            # Some estimators with early stopping enabled require eval_set at fit time.
+            # For the final refit, fall back to fitting with the full dataset as eval_set.
+            self.best_model.fit(
+                X,
+                y,
+                eval_set=[(X, y)],
+                verbose=False,
+            )
         return self
     
     def get_best_params(self) -> Dict[str, Any]:

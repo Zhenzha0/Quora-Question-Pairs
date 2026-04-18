@@ -140,7 +140,16 @@ class XGBoostModel:
         }
     
     def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> None:
-        self._model.fit(X_train, y_train)
+        try:
+            self._model.fit(X_train, y_train)
+        except ValueError as exc:
+            message = str(exc)
+            if "validation dataset" not in message and "early stopping" not in message:
+                raise
+
+            # If no validation set is provided, disable early stopping and refit.
+            self._model.set_params(early_stopping_rounds=None)
+            self._model.fit(X_train, y_train)
 
     def predict_proba(self, X_test: np.ndarray) -> np.ndarray:
         return self._model.predict_proba(X_test)[:, 1].astype(np.float32)
