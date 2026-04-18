@@ -32,12 +32,15 @@ it can transform PairRecords.  It computes five groups of IDF-based features:
     tfidf_dot        — raw dot product of the (already L2-normalised) TF-IDF vectors
     Interpretation: A direct similarity measure in TF-IDF space.
 
-Performance note
-----------------
-At transform time, vectors are looked up from a pre-computed cache keyed by
-question string (populated during fit_transform / a warm-up pass), so
-repeated or batched calls are O(1) per pair rather than O(vocab_size).
-For unseen questions the vector is computed on-demand and cached.
+Performance / memory note
+-------------------------
+Each question vector has at most ~(tokens-in-question) non-zero entries (typically
+< 30), so it is kept as a **sparse CSR row** in the cache rather than a dense
+``(1, vocab_size)`` array.  For 450 k training questions with a 50 k vocabulary,
+this reduces memory from ~90 GB (dense float32) to ~100 MB.
+
+All pairwise features below are computed directly on sparse rows — we never
+materialise a dense ``(vocab_size,)`` vector at transform time.
 
 Usage example
 -------------
@@ -69,7 +72,9 @@ import time
 from typing import TYPE_CHECKING
 
 import numpy as np
+import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import normalize
 
 if TYPE_CHECKING:
     from data import PairRecord
@@ -87,6 +92,9 @@ _IDF_RARE_PERCENTILE: float = 75.0
 _TOP_K_ALIGNMENT: int = 3
 
 _LOG_PREFIX = "[TfidfPairFeaturizer]"
+
+# Progress-log every N caching batches
+_CACHE_BATCH_SIZE: int = 50_000
 
 
 def _fmt_secs(seconds: float) -> str:
@@ -158,9 +166,13 @@ class TfidfPairFeaturizer:
         self.idf_: np.ndarray = np.empty(0)
         self._idf_rare_threshold: float = 0.0
         self._fitted: bool = False
+        self._n_features: int = 0
 
-        # Cache: question string → dense L2-normalised TF-IDF vector
-        self._vec_cache: dict[str, np.ndarray] = {}
+        # Cache: question string → (raw_csr_row, l2_normed_csr_row)
+        # Each CSR row is a (1, vocab_size) sparse matrix; keeping it sparse
+        # avoids the ~90 GB dense-matrix blow-up that previously OOM'd
+        # on the full Quora training set.
+        self._vec_cache: dict[str, tuple[sp.csr_matrix, sp.csr_matrix]] = {}
 
     # ------------------------------------------------------------------
     # Logging helper
@@ -214,6 +226,7 @@ class TfidfPairFeaturizer:
         self._vectorizer = tfidf
         self.vocab_ = tfidf.vocabulary_          # token → col index
         self.idf_ = tfidf.idf_.astype(np.float32)
+        self._n_features = len(self.vocab_)
 
         self._idf_rare_threshold = float(
             np.percentile(self.idf_, self._idf_rare_percentile)
@@ -247,6 +260,9 @@ class TfidfPairFeaturizer:
         Call this with your test questions after fit() to avoid recomputing
         vectors on every transform() call.
 
+        Vectors are stored as sparse CSR rows to keep memory usage proportional
+        to the total number of tokens rather than ``n_questions × vocab_size``.
+
         Parameters
         ----------
         questions : list[str]
@@ -256,7 +272,8 @@ class TfidfPairFeaturizer:
 
         t0 = time.time()
         n_requested = len(questions)
-        unique = list({q for q in questions if q not in self._vec_cache})
+        # Preserve order while deduplicating
+        unique = [q for q in dict.fromkeys(questions) if q not in self._vec_cache]
         n_new = len(unique)
         n_cached_hits = n_requested - n_new if n_requested >= n_new else 0
 
@@ -270,18 +287,29 @@ class TfidfPairFeaturizer:
         self._log(
             f"cache_questions(): transforming {n_new:,} new questions "
             f"({n_requested:,} requested, {n_cached_hits:,} already in cache) | "
-            f"vocab_size={len(self.vocab_):,}"
+            f"vocab_size={len(self.vocab_):,} (sparse storage)"
         )
 
-        sparse = self._vectorizer.transform(unique)   # (n, vocab)
-        dense  = sparse.toarray().astype(np.float32)
-        # L2-normalise each row for cosine similarity
-        norms  = np.linalg.norm(dense, axis=1, keepdims=True)
-        normed = dense / np.clip(norms, 1e-12, None)
+        # Process in batches so peak transient memory stays small.
+        for start in range(0, n_new, _CACHE_BATCH_SIZE):
+            end = min(start + _CACHE_BATCH_SIZE, n_new)
+            chunk = unique[start:end]
 
-        for q, raw_vec, norm_vec in zip(unique, dense, normed):
-            # Store both raw (for diff features) and normalised (for cosine)
-            self._vec_cache[q] = (raw_vec, norm_vec)
+            sparse = self._vectorizer.transform(chunk).tocsr()          # (b, vocab)
+            sparse = sparse.astype(np.float32, copy=False)
+            normed = normalize(sparse, norm="l2", axis=1, copy=True)    # row-wise L2
+
+            # Store each row as its own CSR matrix (views share data buffers
+            # with the parent, but once the parent goes out of scope only
+            # the slices are retained).
+            for j, q in enumerate(chunk):
+                self._vec_cache[q] = (sparse.getrow(j), normed.getrow(j))
+
+            if self._verbose and end < n_new:
+                self._log(
+                    f"cache_questions(): progress {end:,}/{n_new:,} "
+                    f"({end / n_new:.0%}) in {_fmt_secs(time.time() - t0)}"
+                )
 
         elapsed = time.time() - t0
         rate = n_new / elapsed if elapsed > 0 else float("inf")
@@ -308,19 +336,20 @@ class TfidfPairFeaturizer:
             return 0.0
         return float(self.idf_[idx])
 
-    def _tfidf_vectors(self, text: str) -> tuple[np.ndarray, np.ndarray]:
+    def _tfidf_vectors(self, text: str) -> tuple[sp.csr_matrix, sp.csr_matrix]:
         """
-        Return (raw_vector, l2_normalised_vector) for a single text string.
+        Return (raw_csr_row, l2_normalised_csr_row) for a single text string.
         Looks up the cache first; on miss, computes and caches.
         """
         assert self._vectorizer is not None
-        if text not in self._vec_cache:
-            sparse = self._vectorizer.transform([text])
-            raw = sparse.toarray()[0].astype(np.float32)
-            norm_val = np.linalg.norm(raw)
-            normed = raw / max(norm_val, 1e-12)
-            self._vec_cache[text] = (raw, normed)
-        return self._vec_cache[text]
+        cached = self._vec_cache.get(text)
+        if cached is not None:
+            return cached
+        raw = self._vectorizer.transform([text]).tocsr().astype(np.float32, copy=False)
+        normed = normalize(raw, norm="l2", axis=1, copy=True)
+        pair = (raw.getrow(0), normed.getrow(0))
+        self._vec_cache[text] = pair
+        return pair
 
     # ------------------------------------------------------------------
     # Transform
@@ -330,20 +359,7 @@ class TfidfPairFeaturizer:
         """
         Compute all IDF-based features for one question pair.
 
-        Returns a flat dict of scalar features (B), (C), (D), (E).
-
-        Parameters
-        ----------
-        r : PairRecord
-
-        Returns
-        -------
-        dict[str, float]
-            Keys:
-              weighted_word_overlap,
-              rare_word_mismatch_count, rare_word_mismatch_weight,
-              top1_word_match, top3_overlap_count,
-              tfidf_diff_mean, tfidf_diff_max, tfidf_diff_l1, tfidf_diff_l2
+        Returns a flat dict of scalar features (B), (C), (D), (E), (F).
         """
         self._check_fitted()
 
@@ -378,7 +394,6 @@ class TfidfPairFeaturizer:
         # (D) Max-IDF word alignment
         # Top-k highest-IDF words from q1, checked against q2
         # ---------------------------------------------------------------
-        # Sort q1 tokens by IDF descending (deduplicated)
         tokens1_ranked = sorted(set1, key=lambda w: self._idf_of(w), reverse=True)
 
         top1_word = tokens1_ranked[0] if tokens1_ranked else None
@@ -388,22 +403,34 @@ class TfidfPairFeaturizer:
         top3_overlap_count = float(sum(1 for w in top3_words if w in set2))
 
         # ---------------------------------------------------------------
-        # (E) TF-IDF difference vector (reduced)
+        # (E) TF-IDF difference vector (reduced) — sparse-safe
         # ---------------------------------------------------------------
         vec1, norm_vec1 = self._tfidf_vectors(r.question1)
         vec2, norm_vec2 = self._tfidf_vectors(r.question2)
-        diff = np.abs(vec1 - vec2)
 
-        tfidf_diff_mean = float(diff.mean())
-        tfidf_diff_max  = float(diff.max())
-        tfidf_diff_l1   = float(diff.sum())
-        tfidf_diff_l2   = float(np.linalg.norm(diff))
+        # (vec1 - vec2) is still sparse; its .data holds only the non-zero
+        # entries (positions where at least one of the two vectors is non-zero),
+        # so operations below run in O(nnz) instead of O(vocab_size).
+        diff = (vec1 - vec2).tocsr()
+        diff_data = diff.data
+        if diff_data.size > 0:
+            abs_data = np.abs(diff_data)
+            tfidf_diff_l1  = float(abs_data.sum())
+            tfidf_diff_l2  = float(np.sqrt((abs_data * abs_data).sum()))
+            tfidf_diff_max = float(abs_data.max())
+        else:
+            tfidf_diff_l1 = tfidf_diff_l2 = tfidf_diff_max = 0.0
+        # mean is taken over the full vocab (including implicit zeros)
+        tfidf_diff_mean = (
+            tfidf_diff_l1 / self._n_features if self._n_features > 0 else 0.0
+        )
 
         # ---------------------------------------------------------------
-        # (F) TF-IDF vector similarity
+        # (F) TF-IDF vector similarity — sparse dot products
         # ---------------------------------------------------------------
-        tfidf_cosine_sim = float(np.dot(norm_vec1, norm_vec2))
-        tfidf_dot        = float(np.dot(vec1, vec2))
+        # .multiply is element-wise and returns sparse; .sum collapses it.
+        tfidf_cosine_sim = float(norm_vec1.multiply(norm_vec2).sum())
+        tfidf_dot        = float(vec1.multiply(vec2).sum())
 
         return {
             # (B)

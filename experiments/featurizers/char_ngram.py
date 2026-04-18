@@ -22,11 +22,16 @@ Feature groups
     char_bin_jaccard       — |support(q1) ∩ support(q2)| / |support(q1) ∪ support(q2)|
                              ("support" = the set of n-grams present in the question)
 
-Performance note
-----------------
-Vectors are batch-computed during fit() and cached keyed by question string.
-transform() is therefore O(1) per pair for seen questions.
-Unseen questions are computed and cached on demand.
+Performance / memory note
+-------------------------
+Each question vector is stored as a **sparse CSR row** plus the integer set of
+its non-zero column indices (used for fast binary Jaccard / cosine).  With
+``max_features = 100 000`` and ~450 k unique training questions, keeping sparse
+rows reduces memory from ~180 GB (dense float32) to a few hundred MB.
+
+Vectors are batch-computed during ``fit()`` / ``cache_questions()`` and cached
+keyed by question string.  ``transform()`` is therefore O(nnz) per pair for
+seen questions.  Unseen questions are computed and cached on demand.
 
 Usage
 -----
@@ -46,13 +51,19 @@ import time
 from typing import TYPE_CHECKING
 
 import numpy as np
+import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import normalize
 
 if TYPE_CHECKING:
     from data import PairRecord
 
 
 _LOG_PREFIX = "[CharNgramFeaturizer]"
+
+# Number of questions per batch when pre-computing vectors.  Keeps peak
+# transient memory bounded, which matters for big char-ngram vocabularies.
+_CACHE_BATCH_SIZE: int = 50_000
 
 
 def _fmt_secs(seconds: float) -> str:
@@ -103,8 +114,13 @@ class CharNgramFeaturizer:
         self._tfidf_vec: TfidfVectorizer | None = None
         self._fitted: bool = False
 
-        # cache: question → (raw_tfidf_vec, normed_tfidf_vec, binary_vec)
-        self._cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        # cache: question → (raw_tfidf_csr_row, normed_tfidf_csr_row, support_indices)
+        #   raw / normed  : scipy.sparse.csr_matrix of shape (1, vocab_size)
+        #   support       : np.ndarray of int column indices where the vector
+        #                   is non-zero, used for O(nnz) Jaccard/binary-cosine.
+        self._cache: dict[
+            str, tuple[sp.csr_matrix, sp.csr_matrix, np.ndarray]
+        ] = {}
 
     # ------------------------------------------------------------------
     # Logging helper
@@ -169,6 +185,12 @@ class CharNgramFeaturizer:
         """
         Pre-compute and cache vectors for a list of questions.
         Safe to call multiple times; already-cached strings are skipped.
+
+        Vectors are stored as sparse CSR rows (raw + L2-normed) plus the
+        integer support (column indices) of each row.  This keeps memory
+        proportional to the total number of non-zero entries (~ O(total chars))
+        rather than O(n_questions × vocab_size), which would be ~180 GB at
+        the defaults.
         """
         self._check_fitted()
         assert self._tfidf_vec is not None
@@ -189,22 +211,37 @@ class CharNgramFeaturizer:
         self._log(
             f"cache_questions(): transforming {n_new:,} new questions "
             f"({n_requested:,} requested, {n_cached_hits:,} already in cache) | "
-            f"vocab_size={len(self._tfidf_vec.vocabulary_):,}"
+            f"vocab_size={len(self._tfidf_vec.vocabulary_):,} (sparse storage)"
         )
 
-        # TF-IDF vectors (sparse → dense)
-        sparse_tfidf = self._tfidf_vec.transform(unique)
-        dense_tfidf  = sparse_tfidf.toarray().astype(np.float32)
+        # Batch to bound peak memory during .transform()
+        for start in range(0, n_new, _CACHE_BATCH_SIZE):
+            end = min(start + _CACHE_BATCH_SIZE, n_new)
+            chunk = unique[start:end]
 
-        # L2-normalise for cosine similarity
-        norms  = np.linalg.norm(dense_tfidf, axis=1, keepdims=True)
-        normed = dense_tfidf / np.clip(norms, 1e-12, None)
+            sparse = self._tfidf_vec.transform(chunk).tocsr()                 # (b, vocab)
+            sparse = sparse.astype(np.float32, copy=False)
+            normed = normalize(sparse, norm="l2", axis=1, copy=True)           # row-wise L2
 
-        # Binary vectors (1 where TF-IDF > 0, else 0)
-        binary = (dense_tfidf > 0).astype(np.float32)
+            # Pre-extract per-row CSR slices and the non-zero column indices.
+            # We build the support arrays from the parent CSR's indptr/indices
+            # buffers, which is much faster than re-materialising per row.
+            indptr = sparse.indptr
+            indices = sparse.indices
+            for j, q in enumerate(chunk):
+                row_start, row_end = indptr[j], indptr[j + 1]
+                support = indices[row_start:row_end].copy()
+                self._cache[q] = (
+                    sparse.getrow(j),
+                    normed.getrow(j),
+                    support,
+                )
 
-        for q, raw, norm, bin_vec in zip(unique, dense_tfidf, normed, binary):
-            self._cache[q] = (raw, norm, bin_vec)
+            if self._verbose and end < n_new:
+                self._log(
+                    f"cache_questions(): progress {end:,}/{n_new:,} "
+                    f"({end / n_new:.0%}) in {_fmt_secs(time.time() - t0)}"
+                )
 
         elapsed = time.time() - t0
         rate = n_new / elapsed if elapsed > 0 else float("inf")
@@ -226,11 +263,13 @@ class CharNgramFeaturizer:
 
     def _get_vectors(
         self, text: str
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return (raw_tfidf, normed_tfidf, binary) vectors, using cache."""
-        if text not in self._cache:
-            # on-demand for unseen strings
-            self.cache_questions([text])
+    ) -> tuple[sp.csr_matrix, sp.csr_matrix, np.ndarray]:
+        """Return (raw_csr_row, normed_csr_row, support_indices) using cache."""
+        cached = self._cache.get(text)
+        if cached is not None:
+            return cached
+        # on-demand for unseen strings
+        self.cache_questions([text])
         return self._cache[text]
 
     # ------------------------------------------------------------------
@@ -250,30 +289,44 @@ class CharNgramFeaturizer:
         """
         self._check_fitted()
 
-        raw1, norm1, bin1 = self._get_vectors(r.question1)
-        raw2, norm2, bin2 = self._get_vectors(r.question2)
+        raw1, norm1, sup1 = self._get_vectors(r.question1)
+        raw2, norm2, sup2 = self._get_vectors(r.question2)
 
-        # (A) TF-IDF reweighted features
-        diff = np.abs(raw1 - raw2)
-        char_tfidf_cosine_sim = float(np.dot(norm1, norm2))
-        char_tfidf_l1_diff    = float(diff.sum())
-        char_tfidf_l2_diff    = float(np.linalg.norm(diff))
-        char_tfidf_dot        = float(np.dot(raw1, raw2))
+        # (A) TF-IDF reweighted features — all operations on sparse rows.
+        diff = (raw1 - raw2).tocsr()
+        diff_data = diff.data
+        if diff_data.size > 0:
+            abs_data = np.abs(diff_data)
+            char_tfidf_l1_diff = float(abs_data.sum())
+            char_tfidf_l2_diff = float(np.sqrt((abs_data * abs_data).sum()))
+        else:
+            char_tfidf_l1_diff = 0.0
+            char_tfidf_l2_diff = 0.0
 
-        # (B) Binary overlap features
-        # Cosine similarity on binary vectors
-        bin_norm1 = np.linalg.norm(bin1)
-        bin_norm2 = np.linalg.norm(bin2)
-        bin_cos_den = bin_norm1 * bin_norm2
-        char_bin_cosine_sim = (
-            float(np.dot(bin1, bin2) / bin_cos_den)
-            if bin_cos_den > 1e-12 else 0.0
-        )
+        char_tfidf_cosine_sim = float(norm1.multiply(norm2).sum())
+        char_tfidf_dot        = float(raw1.multiply(raw2).sum())
 
-        # Jaccard on n-gram supports
-        inter = float(np.minimum(bin1, bin2).sum())   # both > 0
-        union = float(np.maximum(bin1, bin2).sum())   # either > 0
-        char_bin_jaccard = inter / union if union > 1e-12 else 0.0
+        # (B) Binary overlap features — use the integer support sets.
+        #
+        # |intersection| = number of n-grams present in BOTH questions
+        # |union|        = number of n-grams present in EITHER question
+        # Cosine of 0/1 vectors = |∩| / sqrt(|sup1| * |sup2|)
+        set1 = sup1
+        set2 = sup2
+        n1 = int(set1.size)
+        n2 = int(set2.size)
+
+        if n1 == 0 or n2 == 0:
+            inter = 0
+        else:
+            # np.intersect1d on pre-sorted (scipy's indices are sorted) ints
+            # is O(n1 + n2) with assume_unique=True.
+            inter = int(np.intersect1d(set1, set2, assume_unique=True).size)
+        union_size = n1 + n2 - inter
+
+        bin_cos_den = np.sqrt(n1 * n2)
+        char_bin_cosine_sim = float(inter / bin_cos_den) if bin_cos_den > 0 else 0.0
+        char_bin_jaccard    = float(inter / union_size) if union_size > 0 else 0.0
 
         return {
             "char_tfidf_cosine_sim": char_tfidf_cosine_sim,
