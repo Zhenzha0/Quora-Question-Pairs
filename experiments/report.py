@@ -122,6 +122,38 @@ def _format_metrics_block(
     return "\n".join(lines)
 
 
+def _write_tuning_visualisations(model, tune_mode: str | None, exp_dir: str) -> None:
+    """Write tuning visualisations when a fitted tuner instance is available."""
+    if tune_mode not in {"random", "optuna"}:
+        return
+
+    tuner = None
+    if hasattr(model, "get_tuner"):
+        try:
+            tuner = model.get_tuner()
+        except Exception as exc:
+            print(f"[report] Could not retrieve tuner from model: {exc}", flush=True)
+            return
+
+    if tuner is None:
+        print(
+            f"[report] Tuning mode was '{tune_mode}' but no fitted tuner was available; "
+            "skipping tuning visualisations.",
+            flush=True,
+        )
+        return
+
+    if not hasattr(tuner, "get_visualisations"):
+        print("[report] Tuner does not expose get_visualisations(); skipping plots.", flush=True)
+        return
+
+    try:
+        tuner.get_visualisations(exp_dir)
+        print("[report] Wrote hyperparameter tuning visualisations.", flush=True)
+    except Exception as exc:
+        print(f"[report] Could not write hyperparameter tuning visualisations: {exc}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -136,6 +168,7 @@ def generate_report(
     threshold: float = 0.5,
     results_dir: str = RESULTS_DIR,
     cli_args: dict | None = None,
+    tune_mode: str | None = None,
 ) -> dict:
     """
     Generate and persist a full experiment report.
@@ -153,7 +186,7 @@ def generate_report(
     results_dir     : root folder for all results (default "results/")
     cli_args        : optional dict of CLI arguments passed to run_experiment.py;
                       included verbatim in config.json for full reproducibility.
-
+    tune_mode       : string indicating the hyperparameter tuning mode used (e.g., "random", "optuna")
     Returns
     -------
     dict with keys accuracy, precision, recall, f1
@@ -263,7 +296,12 @@ def generate_report(
             print(f"[report] Could not write feature importances: {exc}", flush=True)
 
     # ------------------------------------------------------------------
-    # 6. Append to all_experiments.csv
+    # 6. Write hyperparameter plots (optional)
+    # ------------------------------------------------------------------
+    _write_tuning_visualisations(model=model, tune_mode=tune_mode, exp_dir=exp_dir)
+            
+    # ------------------------------------------------------------------
+    # 7. Append to all_experiments.csv
     # ------------------------------------------------------------------
     summary_path = os.path.join(results_dir, "all_experiments.csv")
     write_header = not os.path.exists(summary_path)

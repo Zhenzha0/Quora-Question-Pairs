@@ -34,7 +34,7 @@ _DEFAULTS = dict(
     verbose=100,
 )
 
-param_space = {'iterations': {'type': 'int', 'low': 100, 'high': 1000}, #number of boosting rounds
+param_space = {'iterations': {'type': 'int', 'low': 100, 'high': 1000}, #number of trees
                'depth': {'type': 'int', 'low': 4, 'high': 10}, #maximum depth of trees -- large trees are more expressive but may overfit
                'learning_rate': {'type': 'float', 'low': 0.01, 'high': 0.3, 'log': True}, #step size - affects speed of convergence to minima
                'l2_leaf_reg': {'type': 'float', 'low': 1.0, 'high': 20.0, 'log': True} #strength of Ridge Regularisation
@@ -65,6 +65,7 @@ class CatBoostModel:
         self._dims = matryoshka_dims
         self._params = params
         self._feature_names: list[str] = []
+        self._last_tuner = None
         self._tuning_info: dict[str, object] = {
             "enabled": False,
         }
@@ -118,6 +119,7 @@ class CatBoostModel:
         print("Best hyperparameters:", best_params)
         self._params.update(best_params)
         self._model.set_params(**best_params)
+        self._last_tuner = tuner
         self._tuning_info = {
             "enabled": True,
             "method": "RandomizedSearchCV",
@@ -140,6 +142,7 @@ class CatBoostModel:
         print("Best hyperparameters:", best_params)
         self._params.update(best_params)
         self._model.set_params(**best_params)
+        self._last_tuner = tuner
         self._tuning_info = {
             "enabled": True,
             "method": "OptunaSearchCV",
@@ -161,6 +164,9 @@ class CatBoostModel:
         """Returns a name → importance mapping (only valid after fit)."""
         importances = self._model.get_feature_importance()
         return dict(zip(self._feature_names, importances.tolist()))
+
+    def get_tuner(self):
+        return self._last_tuner
 
     def get_config(self) -> dict:
         """

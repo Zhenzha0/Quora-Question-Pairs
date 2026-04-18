@@ -360,8 +360,9 @@ def run(args: argparse.Namespace) -> None:
             )
     else:
         print("[run] Hyperparameter tuning skipped.", flush=True)
-        model.fit(X_train, y_train)
-        
+
+    model.fit(X_train, y_train)
+
     print(f"[run] Fit complete in {time.time() - t_fit:.1f}s", flush=True)
 
     # ------------------------------------------------------------------
@@ -397,6 +398,7 @@ def run(args: argparse.Namespace) -> None:
         threshold=threshold,
         results_dir=results_dir,
         cli_args=cli_args_dict,
+        tune_mode=args.tune_mode
     )
 
     _maybe_dvc_push(
