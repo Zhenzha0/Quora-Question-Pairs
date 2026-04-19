@@ -34,7 +34,7 @@ _DEFAULTS = dict(
     verbose=100,
 )
 
-param_space = {'iterations': {'type': 'int', 'low': 100, 'high': 1000}, #number of boosting rounds
+param_space = {'iterations': {'type': 'int', 'low': 100, 'high': 1000}, #number of trees
                'depth': {'type': 'int', 'low': 4, 'high': 10}, #maximum depth of trees -- large trees are more expressive but may overfit
                'learning_rate': {'type': 'float', 'low': 0.01, 'high': 0.3, 'log': True}, #step size - affects speed of convergence to minima
                'l2_leaf_reg': {'type': 'float', 'low': 1.0, 'high': 20.0, 'log': True} #strength of Ridge Regularisation
@@ -65,6 +65,7 @@ class CatBoostModel:
         self._dims = matryoshka_dims
         self._params = params
         self._feature_names: list[str] = []
+        self._last_tuner = None
         self._tuning_info: dict[str, object] = {
             "enabled": False,
         }
@@ -118,6 +119,7 @@ class CatBoostModel:
         print("Best hyperparameters:", best_params)
         self._params.update(best_params)
         self._model.set_params(**best_params)
+        self._last_tuner = tuner
         self._tuning_info = {
             "enabled": True,
             "method": "RandomizedSearchCV",
@@ -129,18 +131,18 @@ class CatBoostModel:
         tuner = OptunaSearchCV(
             estimator=CatBoostClassifier(**_DEFAULTS),
             param_distributions=param_space,
-            n_iter=20,
+            n_trials=20,
             cv=5,
             scoring="f1",
-            random_state=42,
-            n_jobs=-1,
-        )
+            random_state=42
+            )
         tuner.fit(X, y)
         best_params = tuner.get_best_params()
         best_score = tuner.get_best_score()
         print("Best hyperparameters:", best_params)
         self._params.update(best_params)
         self._model.set_params(**best_params)
+        self._last_tuner = tuner
         self._tuning_info = {
             "enabled": True,
             "method": "OptunaSearchCV",
@@ -148,7 +150,49 @@ class CatBoostModel:
             "best_params": best_params,
         }
 
+    # ------------------------------------------------------------------
+    # Hooks used by experiments/tune.py (the dedicated tuning entry point)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def get_tuning_spec(cls) -> dict:
+        """
+        Describe how this model should be tuned.
+
+        Consumed by experiments/tune.py. Returns a fresh estimator seeded with
+        the same _DEFAULTS that __init__ uses, plus the Optuna-style search
+        space and the scoring metric.
+        """
+        return {
+            "estimator":   CatBoostClassifier(**_DEFAULTS),
+            "param_space": param_space,
+            "scoring":     "f1",
+        }
+
+    def apply_tuned_params(
+        self,
+        best_params: dict,
+        *,
+        source: str | None = None,
+        cv_score: float | None = None,
+        method: str = "external",
+    ) -> None:
+        """
+        Apply hyperparameters produced by an out-of-band tuning run
+        (e.g. experiments/tune.py writing best_params.json).
+        """
+        self._params.update(best_params)
+        self._model.set_params(**best_params)
+        self._tuning_info = {
+            "enabled":       True,
+            "method":        method,
+            "best_cv_score": float(cv_score) if cv_score is not None else None,
+            "best_params":   dict(best_params),
+            "source":        source,
+        }
+
     def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> None:
+
         self._model.fit(X_train, y_train)
 
     def predict_proba(self, X_test: np.ndarray) -> np.ndarray:
@@ -162,6 +206,9 @@ class CatBoostModel:
         """Returns a name → importance mapping (only valid after fit)."""
         importances = self._model.get_feature_importance()
         return dict(zip(self._feature_names, importances.tolist()))
+
+    def get_tuner(self):
+        return self._last_tuner
 
     def get_config(self) -> dict:
         """

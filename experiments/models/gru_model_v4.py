@@ -1,7 +1,7 @@
 """
 gru_model_v4.py — Siamese GRU, fourth iteration.
 
-New capability vs v3: Cross-Encoder score as a scalar bridge feature.
+New capability vs v3: Cross-Encoder features as a multi-dimensional bridge.
   ─────────────────────────────────────────────────────────────────────────
   MOTIVATION
   The previous scalar bridge (v3) gave the MLP head six analytic similarity
@@ -9,25 +9,31 @@ New capability vs v3: Cross-Encoder score as a scalar bridge feature.
   re-ranks the *full text* of both questions jointly — it attends to every
   token in both questions simultaneously — which lets it capture lexical
   overlap, paraphrase patterns, and subtle nuance that a bi-encoder's fixed
-  pooled vector inevitably loses.  Adding this as a single extra scalar
-  costs almost nothing in parameters but gives the classifier a near-oracle
-  signal to condition on.
+  pooled vector inevitably loses.
 
   IMPLEMENTATION
-  The cross-encoder scores are stored in cross_encoder_scores.zarr, keyed
-  by (qid1, qid2).  build_features() loads the zarr, builds a dict lookup,
-  and appends the score as the 7th scalar (index 6) after the six analytic
-  features inherited from v3.  Pairs that are absent from the zarr (e.g.
-  after a max-rows subsample) receive a fallback score of 0.5, which is
-  the decision boundary and therefore has zero net bias.
+  The cross-encoder output is loaded from cross_encoder_scores.zarr.
+  If the zarr contains a 'cross_encoder_features' array of shape (N, ce_dim)
+  — e.g. the CLS-token embedding extracted from the last hidden layer during
+  cross-encoding — all ce_dim columns are appended to the scalar bridge.
+  If only the legacy scalar 'cross_encoder_score' array is present, it is
+  reshaped to (N, 1) and used as a single CE feature (backwards-compatible).
+
+  This means the model automatically adapts to however many dimensions the
+  cross-encoder produces, rather than hardcoding a fixed +1 increment.
 
   CHANGES vs v3
   ─────────────────────────────────────────────────────────────────────────
-  • n_scalar       : 6  →  7  (adds cross_encoder_score)
-  • _N_SCALAR      : 6  →  7
-  • build_features : loads cross_encoder_scores.zarr and appends the score
-  • __init__       : accepts cross_encoder_zarr path (default ../cross_encoder_scores.zarr)
-  • clf_in         : 4*h_full + 7  (one extra input neuron)
+  • n_scalar       : 6 + ce_dim  (ce_dim discovered at build_features time)
+  • _N_SCALAR      : removed as a module-level constant; stored as
+                     self._n_scalar after build_features() is called
+  • build_features : loads cross_encoder_scores.zarr; uses
+                     'cross_encoder_features' (N, ce_dim) if available,
+                     else falls back to 'cross_encoder_score' (N,) → (N, 1)
+  • _compute_scalars     : ce argument is pre-shaped (N, ce_dim); no reshape
+  • _load_cross_encoder_lookup  : returns (index_lookup, features, ce_dim)
+  • __init__       : adds self._n_scalar attribute
+  • clf_in         : 4*h_full + n_scalar  (n_scalar is now dynamic)
 
   Everything else — attention pooling, deep MLP, AdamW, gradient clipping,
   ReduceLROnPlateau, early stopping, capped pos_weight, recall-friendly
@@ -74,7 +80,7 @@ class _SiameseGRUv4(nn.Module):
         num_layers: int     = 2,
         dropout: float      = 0.3,
         mlp_hidden: int     = 512,
-        n_scalar: int       = 7,      # 6 analytic + 1 cross-encoder score
+        n_scalar: int       = 7,      # 6 analytic + ce_dim CE features
     ):
         super().__init__()
         self.seq_len    = embedding_dim // chunk_size
@@ -98,7 +104,7 @@ class _SiameseGRUv4(nn.Module):
         self.attn = _AttentionPool(h_full)
 
         # deep MLP classifier
-        # input = 4*h_full (GRU interaction) + n_scalar (analytic + cross-encoder)
+        # input = 4*h_full (GRU interaction) + n_scalar (analytic + CE features)
         clf_in = 4 * h_full + n_scalar
         self.classifier = nn.Sequential(
             nn.LayerNorm(clf_in),
@@ -133,29 +139,27 @@ class _SiameseGRUv4(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Scalar bridge: analytic similarity + cross-encoder score
+# Scalar bridge: analytic similarity + cross-encoder features
 # ---------------------------------------------------------------------------
 
 def _compute_scalars(
     emb1_np: np.ndarray,
     emb2_np: np.ndarray,
-    ce_scores: np.ndarray,
+    ce_features: np.ndarray,    # (N, ce_dim) — pre-shaped by the caller
 ) -> np.ndarray:
     """
-    Returns (N, 7) float32 array of scalar bridge features:
+    Returns (N, 6 + ce_dim) float32 array of scalar bridge features:
       0: cosine similarity      (normalised dot product)
       1: L2 (Euclidean) distance
       2: dot product of raw embeddings
       3: |norm1 − norm2|        (magnitude difference)
       4: element-wise product mean
       5: element-wise absolute-difference mean
-      6: cross-encoder score    (NEW — joint full-text re-ranker probability)
+      6…6+ce_dim-1: cross-encoder output (whatever the zarr contains)
 
-    The cross-encoder score (index 6) is the only feature that requires the
-    original question text; all others are computed purely from embeddings.
-    It gives the classifier a near-oracle signal while the GRU still learns
-    what the cross-encoder cannot easily represent (sequence-level structure
-    in the embedding space).
+    ce_features is already shaped (N, ce_dim) by build_features(); no reshape
+    is applied here.  If the zarr has a 1-D score it arrives as (N, 1).
+    If the zarr has a full hidden-state embedding it arrives as (N, hidden_dim).
     """
     norm1   = np.linalg.norm(emb1_np, axis=1, keepdims=True).clip(min=1e-12)
     norm2   = np.linalg.norm(emb2_np, axis=1, keepdims=True).clip(min=1e-12)
@@ -168,39 +172,63 @@ def _compute_scalars(
     norm_diff = np.abs(norm1 - norm2)                                        # (N,1)
     prod_mean = (emb1_np * emb2_np).mean(axis=1, keepdims=True)             # (N,1)
     diff_mean = np.abs(emb1_np - emb2_np).mean(axis=1, keepdims=True)      # (N,1)
-    ce        = ce_scores.reshape(-1, 1)                                     # (N,1)
 
     return np.concatenate(
-        [cos_sim, l2_dist, dot_raw, norm_diff, prod_mean, diff_mean, ce], axis=1
-    ).astype(np.float32)   # (N, 7)
+        [cos_sim, l2_dist, dot_raw, norm_diff, prod_mean, diff_mean, ce_features],
+        axis=1,
+    ).astype(np.float32)   # (N, 6 + ce_dim)
 
 
 # ---------------------------------------------------------------------------
-# Cross-encoder score loader
+# Cross-encoder feature loader
 # ---------------------------------------------------------------------------
 
-def _load_cross_encoder_lookup(zarr_path: str) -> dict[tuple[int, int], float]:
+def _load_cross_encoder_lookup(
+    zarr_path: str,
+) -> tuple[dict[tuple[int, int], int], np.ndarray, int]:
     """
-    Load cross_encoder_scores.zarr and return a dict mapping
-    (qid1, qid2) → cross_encoder_score (float32).
+    Load cross_encoder_scores.zarr.
 
-    The zarr store is expected to contain arrays named 'qid1', 'qid2', and
-    'cross_encoder_score', all of length N.
+    Returns
+    -------
+    index_lookup : dict (qid1, qid2) → integer row index into `features`
+    features     : np.ndarray shape (N, ce_dim)
+    ce_dim       : int — number of dimensions per CE feature vector
+
+    If 'cross_encoder_features' (2-D array, shape N × ce_dim) is present in
+    the zarr it is loaded directly — giving the full multi-dimensional CE
+    output (e.g. the CLS-token hidden state).  If only the legacy
+    'cross_encoder_score' (1-D) exists it is reshaped to (N, 1) so the rest
+    of the pipeline sees a uniform (N, ce_dim) interface.
     """
-    print(f"  [GRU v4] Loading cross-encoder scores from: {zarr_path}", flush=True)
-    store  = zarr.open(zarr_path, mode="r")
-    qid1s  = store["qid1"][:].astype(np.int64)
-    qid2s  = store["qid2"][:].astype(np.int64)
-    scores = store["cross_encoder_score"][:].astype(np.float32)
+    print(f"  [GRU v4] Loading cross-encoder features from: {zarr_path}", flush=True)
+    store = zarr.open(zarr_path, mode="r")
+    qid1s = store["qid1"][:].astype(np.int64)
+    qid2s = store["qid2"][:].astype(np.int64)
 
-    # Diagnostic: print a few sample zarr key pairs so we can verify they match the CSV qids.
+    if "cross_encoder_features" in store:
+        features = store["cross_encoder_features"][:].astype(np.float32)   # (N, ce_dim)
+        print(
+            f"  [GRU v4] Loaded 'cross_encoder_features', shape={features.shape}",
+            flush=True,
+        )
+    else:
+        # Backwards-compatible fallback: treat scalar score as a 1-D feature
+        features = store["cross_encoder_score"][:].astype(np.float32).reshape(-1, 1)
+        print(
+            f"  [GRU v4] 'cross_encoder_features' not found; "
+            f"using scalar 'cross_encoder_score' as (N, 1)",
+            flush=True,
+        )
+
+    ce_dim = features.shape[1]
+
+    # Diagnostic: show a few sample (qid1, qid2) keys from the zarr.
     print(
         f"  [GRU v4] Zarr sample keys (qid1, qid2): "
         + ", ".join(f"({qid1s[i]}, {qid2s[i]})" for i in range(min(5, len(qid1s)))),
         flush=True,
     )
-    # Also report whether the zarr has an 'index' array (CSV row id) which some
-    # generation scripts use instead of qids.
     if "index" in store:
         idx_arr = store["index"][:].astype(np.int64)
         print(
@@ -209,12 +237,17 @@ def _load_cross_encoder_lookup(zarr_path: str) -> dict[tuple[int, int], float]:
             flush=True,
         )
 
-    lookup: dict[tuple[int, int], float] = {
-        (int(q1), int(q2)): float(s)
-        for q1, q2, s in zip(qid1s, qid2s, scores)
+    # Map (qid1, qid2) → row index (int) into the features array.
+    # Storing row indices rather than whole vectors keeps the dict lean.
+    index_lookup: dict[tuple[int, int], int] = {
+        (int(q1), int(q2)): i
+        for i, (q1, q2) in enumerate(zip(qid1s, qid2s))
     }
-    print(f"  [GRU v4] Cross-encoder lookup size: {len(lookup):,}", flush=True)
-    return lookup
+    print(
+        f"  [GRU v4] CE lookup: {len(index_lookup):,} pairs, ce_dim={ce_dim}",
+        flush=True,
+    )
+    return index_lookup, features, ce_dim
 
 
 # ---------------------------------------------------------------------------
@@ -245,15 +278,12 @@ _DEFAULTS: dict = dict(
     threshold      = 0.42,
     seed           = 42,
     # Cross-encoder zarr path (relative to repo root or absolute).
-    # Resolved at build_features() time; can be overridden in the constructor.
     cross_encoder_zarr = "../cross_encoder_scores.zarr",
-    # Fallback cross-encoder score for pairs absent from the zarr
-    # (e.g. when --max-rows subsamples the dataset).
-    # 0.5 sits at the decision boundary and introduces zero net bias.
-    ce_fallback = 0.5,
 )
 
-_N_SCALAR = 7   # must match _compute_scalars output width
+# Number of fixed analytic scalar features (cos_sim, l2_dist, dot_raw,
+# norm_diff, prod_mean, diff_mean).  CE features add ce_dim more on top.
+_N_SCALAR_ANALYTIC = 6
 
 
 class GRUModelV4:
@@ -265,58 +295,64 @@ class GRUModelV4:
         self._model: _SiameseGRUv4 | None = None
         self._device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._feature_names: list[str] | None = None
+        # Total scalar bridge width (analytic + CE); set in build_features().
+        self._n_scalar: int | None = None
 
     # -- interface: build_features -------------------------------------------
 
     def build_features(self, records):
         """
-        X = [emb1 | emb2 | scalars(7)]  shape (N, 2*emb_dim + 7)
+        X = [emb1 | emb2 | scalars(6 + ce_dim)]
+        shape (N, 2*emb_dim + 6 + ce_dim)
 
-        The last 7 columns are the scalar bridge features:
-          [cos_sim, l2_dist, dot_raw, norm_diff, prod_mean, diff_mean,
-           cross_encoder_score]
+        ce_dim is determined dynamically from cross_encoder_scores.zarr:
+          • If 'cross_encoder_features' (N, ce_dim) is present → ce_dim columns
+          • Otherwise 'cross_encoder_score' (N,) is used as ce_dim = 1
 
-        Cross-encoder scores are loaded from cross_encoder_scores.zarr and
-        aligned to records by (qid1, qid2).  Any pair missing from the zarr
-        (atypical; can occur with --max-rows) falls back to cfg['ce_fallback'].
+        Missing pairs (absent from zarr) fall back to a zero vector of shape
+        (ce_dim,), which is neutral and introduces no bias.
         """
         ce_zarr_path = self.cfg["cross_encoder_zarr"]
-        ce_lookup = _load_cross_encoder_lookup(ce_zarr_path)
+        ce_index_lookup, ce_features_all, ce_dim = _load_cross_encoder_lookup(ce_zarr_path)
 
-        # Diagnostic: print first few (qid1, qid2) from records to compare with zarr keys.
+        # Diagnostic: print first few record keys for comparison with zarr keys.
         print(
             f"  [GRU v4] Record sample keys (qid1, qid2): "
             + ", ".join(f"({r.qid1}, {r.qid2})" for r in records[:5]),
             flush=True,
         )
 
-        fallback   = float(self.cfg["ce_fallback"])
-        emb1       = np.array([r.emb1   for r in records], dtype=np.float32)
-        emb2       = np.array([r.emb2   for r in records], dtype=np.float32)
-        y          = np.array([r.label  for r in records], dtype=np.int64)
-        ce_scores  = np.array(
-            [
-                ce_lookup.get(
-                    (r.qid1, r.qid2),
-                    ce_lookup.get((r.qid2, r.qid1), fallback),
-                )
-                for r in records
-            ],
-            dtype=np.float32,
-        )
+        emb1 = np.array([r.emb1  for r in records], dtype=np.float32)
+        emb2 = np.array([r.emb2  for r in records], dtype=np.float32)
+        y    = np.array([r.label for r in records], dtype=np.int64)
 
-        n_missing = sum(
-            1 for r in records
-            if (r.qid1, r.qid2) not in ce_lookup and (r.qid2, r.qid1) not in ce_lookup
-        )
+        # Build CE feature matrix (N, ce_dim) using row-index lookup.
+        # Absent pairs receive a zero vector (decision-boundary neutral).
+        fallback = np.zeros(ce_dim, dtype=np.float32)
+        ce_feats_list: list[np.ndarray] = []
+        n_missing = 0
+        for r in records:
+            row_idx = ce_index_lookup.get(
+                (r.qid1, r.qid2),
+                ce_index_lookup.get((r.qid2, r.qid1), -1),
+            )
+            if row_idx >= 0:
+                ce_feats_list.append(ce_features_all[row_idx])
+            else:
+                ce_feats_list.append(fallback)
+                n_missing += 1
+        ce_features = np.array(ce_feats_list, dtype=np.float32)   # (N, ce_dim)
+
         if n_missing:
             print(
-                f"  [GRU v4] {n_missing}/{len(records)} pairs not found in "
-                f"cross-encoder zarr; using fallback={fallback:.3f}",
+                f"  [GRU v4] {n_missing}/{len(records)} pairs missing from CE zarr; "
+                f"using zero fallback, shape={fallback.shape}",
                 flush=True,
             )
 
-        scalars = _compute_scalars(emb1, emb2, ce_scores)   # (N, 7)
+        scalars = _compute_scalars(emb1, emb2, ce_features)   # (N, 6 + ce_dim)
+        self._n_scalar = _N_SCALAR_ANALYTIC + ce_dim
+
         X = np.concatenate([emb1, emb2, scalars], axis=1)
 
         self._feature_names = (
@@ -329,18 +365,23 @@ class GRUModelV4:
                 "scalar_norm_diff",
                 "scalar_prod_mean",
                 "scalar_diff_mean",
-                "scalar_cross_encoder_score",
-            ]
+            ] +
+            [f"ce_feat_{i}" for i in range(ce_dim)]
         )
         return X, y, self._feature_names
 
     # -- interface: fit ------------------------------------------------------
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> None:
+        assert self._n_scalar is not None, (
+            "build_features() must be called before fit() so that "
+            "self._n_scalar (= 6 + ce_dim) is known."
+        )
+
         torch.manual_seed(self.cfg["seed"])
         np.random.seed(self.cfg["seed"])
 
-        dim = (X_train.shape[1] - _N_SCALAR) // 2   # embedding dimension
+        dim = (X_train.shape[1] - self._n_scalar) // 2   # embedding dimension
 
         # ---- train / val split ------------------------------------------- #
         val_frac = float(self.cfg["val_frac"])
@@ -392,7 +433,7 @@ class GRUModelV4:
             num_layers    = self.cfg["num_layers"],
             dropout       = self.cfg["dropout"],
             mlp_hidden    = self.cfg["mlp_hidden"],
-            n_scalar      = _N_SCALAR,
+            n_scalar      = self._n_scalar,
         ).to(self._device)
 
         optimizer = torch.optim.AdamW(
@@ -492,7 +533,11 @@ class GRUModelV4:
     # -- interface: predict_proba --------------------------------------------
 
     def predict_proba(self, X_test: np.ndarray) -> np.ndarray:
-        dim  = (X_test.shape[1] - _N_SCALAR) // 2
+        assert self._n_scalar is not None, (
+            "build_features() must be called before predict_proba() so that "
+            "self._n_scalar (= 6 + ce_dim) is known."
+        )
+        dim  = (X_test.shape[1] - self._n_scalar) // 2
         emb1 = torch.from_numpy(X_test[:, :dim])
         emb2 = torch.from_numpy(X_test[:, dim: 2 * dim])
         sc   = torch.from_numpy(X_test[:, 2 * dim:])
@@ -530,5 +575,6 @@ class GRUModelV4:
         return {
             "model_class": "SiameseGRU_v4",
             "total_params": params,
+            "n_scalar": self._n_scalar,
             **self.cfg,
         }

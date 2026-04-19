@@ -87,6 +87,7 @@ class RandomForestTopKModel:
         self._k_candidates = tuple(sorted(set(k_candidates or _DEFAULT_K_CANDIDATES)))
         self._dims = matryoshka_dims
         self._params = params
+        self._last_tuner = None
         self._tuning_info: dict[str, object] = {
             "enabled": False,
         }
@@ -156,6 +157,7 @@ class RandomForestTopKModel:
         best_rf_params = tuner.get_best_params()
         best_rf_score = tuner.get_best_score()
         print("Best RF hyperparameters:", best_rf_params)
+        self._last_tuner = tuner
 
         self._params.update(best_rf_params)
         self._selector_model.set_params(**best_rf_params)
@@ -260,6 +262,9 @@ class RandomForestTopKModel:
 
         importances = self._final_model.feature_importances_
         return dict(zip(self._selected_feature_names, importances.tolist()))
+
+    def get_tuner(self):
+        return self._last_tuner
 
     def get_config(self) -> dict:
         dims_used = (

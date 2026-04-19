@@ -8,6 +8,9 @@ Provides two approaches for hyperparameter optimization:
 
 from typing import Any, Dict, Optional, Tuple
 import numpy as np
+import os
+import sklearn
+import matplotlib.pyplot as plt
 from sklearn.model_selection import RandomizedSearchCV as SklearnRandomizedSearchCV
 from sklearn.base import clone
 from scipy.stats import randint, uniform, loguniform
@@ -159,6 +162,34 @@ class RandomizedSearchCV:
         if self.best_model is None:
             raise ValueError("Model has not been fitted yet. Call fit() first.")
         return self.best_model.predict(X)
+    
+    def get_visualisations(self, exp_dir: str) -> None:
+        """Get visualizations for hyperparameter importance and optimization history."""
+        if self.search is None:
+            raise ValueError("Model has not been fitted yet. Call fit() first.")
+        
+        plots_dir = os.path.join(exp_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+
+        # Note: sklearn's RandomizedSearchCV does not have built-in visualizations like Optuna.
+        # We can create some basic plots using the cv_results_ attribute.
+
+        results = self.search.cv_results_
+        params = results['params']
+        mean_test_scores = results['mean_test_score']
+
+        # Example: Plot mean test score vs. one of the hyperparameters (if it's numeric)
+        for param_name in self.param_distributions.keys():
+            if isinstance(params[0][param_name], (int, float)):
+                param_values = [p[param_name] for p in params]
+                plt.figure(figsize=(8, 6))
+                plt.scatter(param_values, mean_test_scores)
+                plt.xlabel(param_name)
+                plt.ylabel('Mean CV Test Score')
+                plt.title(f'Hyperparameter Tuning: {param_name} vs. Mean CV Score')
+                plt.grid()
+                plt.savefig(f"{plots_dir}/cv_score_vs_{param_name}.png")
+                plt.close()
 
 
 class OptunaSearchCV:
@@ -241,7 +272,7 @@ class OptunaSearchCV:
         model.set_params(**params)
         
         skf = StratifiedKFold(n_splits=self.cv, shuffle=True, random_state=self.random_state)
-        scorer = get_scorer(self.scoring) if self.scoring else None
+        scorer = get_scorer(self.scoring) if self.scoring else None #e.g F1
         
         fold_scores = []
         
@@ -249,8 +280,23 @@ class OptunaSearchCV:
         for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X, y)):
             X_train, X_val = X[train_idx], X[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
-            
-            model.fit(X_train, y_train)
+
+            try:
+                model.fit(X_train, y_train)
+            except ValueError as exc:
+                message = str(exc)
+                if "validation dataset" not in message and "early stopping" not in message:
+                    raise
+
+                # Some estimators (notably XGBoost/CatBoost when early stopping is enabled)
+                # require a validation set during fit(). Use the held-out CV fold as the
+                # validation data for this trial.
+                model.fit(
+                    X_train,
+                    y_train,
+                    eval_set=[(X_val, y_val)],
+                    verbose=False,
+                )
             
             # Calculate score for this fold
             if scorer:
@@ -309,7 +355,21 @@ class OptunaSearchCV:
         self.best_model = clone(self.estimator)
         self.best_model.set_params(**self.best_params)
 
-        self.best_model.fit(X, y)
+        try:
+            self.best_model.fit(X, y)
+        except ValueError as exc:
+            message = str(exc)
+            if "validation dataset" not in message and "early stopping" not in message:
+                raise
+
+            # Some estimators with early stopping enabled require eval_set at fit time.
+            # For the final refit, fall back to fitting with the full dataset as eval_set.
+            self.best_model.fit(
+                X,
+                y,
+                eval_set=[(X, y)],
+                verbose=False,
+            )
         return self
     
     def get_best_params(self) -> Dict[str, Any]:
@@ -341,3 +401,23 @@ class OptunaSearchCV:
         if self.study is None:
             raise ValueError("Model has not been fitted yet. Call fit() first.")
         return self.study
+    
+    def get_visualisations(self, exp_dir: str) -> None:
+        """Get Optuna visualizations for hyperparameter importance and optimization history."""
+        if self.study is None:
+            raise ValueError("Model has not been fitted yet. Call fit() first.")
+        
+        plots_dir = os.path.join(exp_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+
+        optimisation_history = optuna.visualization.plot_optimization_history(self.study)
+        param_importances = optuna.visualization.plot_param_importances(self.study)
+        parallel_coordinates = optuna.visualization.plot_parallel_coordinate(self.study)
+
+        optimisation_history.write_html(f"{plots_dir}/optimization_history.html")
+        param_importances.write_html(f"{plots_dir}/param_importances.html")
+        parallel_coordinates.write_html(f"{plots_dir}/parallel_coordinates.html")
+
+        for var in self.param_distributions.keys():
+            slice_plot = optuna.visualization.plot_slice(self.study, params=[var])
+            slice_plot.write_html(f"{plots_dir}/slice_{var}.html")

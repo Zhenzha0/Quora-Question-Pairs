@@ -14,9 +14,16 @@ Optional flags:
     --max-rows   INT    Subsample the dataset (e.g. 50000 for smoke-tests)
     --test-size  FLOAT  Fraction held out for testing (default: 0.20)
     --threshold  FLOAT  Decision threshold (default: model's own, else 0.5)
-    --tune              Force hyperparameter tuning when supported by model
-    --no-tune           Skip hyperparameter tuning even if model supports it
+    --tune-random       Run RandomizedSearchCV tuning when supported by model
+    --tune-optuna       Run OptunaSearchCV tuning when supported by model
+                        (deprecated — prefer running experiments/tune.py, then
+                         passing the resulting best_params.json via --params-file)
+    --no-tune           Skip hyperparameter tuning
+    --params-file PATH  Load hyperparameters from a JSON file produced by
+                        experiments/tune.py (mutually exclusive with --tune-*).
+                        Example: results/tuning/<name>/best_params.json
     --zarr              PATH   Path to embeddings.zarr (default: ../embeddings.zarr)
+
     --cross-encoder-zarr PATH  Path to cross_encoder_scores.zarr (default: ../cross_encoder_scores.zarr)
     --split-file PATH   Path to .npz split file (default: splits/default_split.npz)
     --results-dir PATH  Where to write reports (default: results/)
@@ -38,10 +45,12 @@ ADDING A NEW MODEL
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 import time
+
 
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -51,7 +60,12 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from data import load_pairs
 from report import generate_report
-from models import CatBoostModel, CosineBaseline, EnsembleModel, LogRegModel, XGBoostModel, RandomForestModel, RandomForestTopKModel, GRUModel, GRUModelV2, GRUModelV3, GRUModelV4, LSTMModel
+from models import (
+    CatBoostModel, CosineBaseline, EnsembleModel, LogRegModel,
+    XGBoostModel, XGBoostClassicalModel,
+    RandomForestModel, RandomForestTopKModel,
+    GRUModel, GRUModelV2, GRUModelV3, GRUModelV4, LSTMModel,
+)
 
 # ---------------------------------------------------------------------------
 # Registry — maps CLI --model name → model instance
@@ -59,6 +73,7 @@ from models import CatBoostModel, CosineBaseline, EnsembleModel, LogRegModel, XG
 
 MODEL_REGISTRY: dict[str, object] = {
     "xgboost": XGBoostModel(),
+    "xgboost_classical": XGBoostClassicalModel(),
     "catboost": CatBoostModel(),
     "logreg":   LogRegModel(),
     "cosine":   CosineBaseline(),
@@ -159,18 +174,39 @@ def parse_args() -> argparse.Namespace:
     )
     tune_group = parser.add_mutually_exclusive_group()
     tune_group.add_argument(
-        "--tune",
-        dest="tune",
-        action="store_true",
-        help="Run hyperparameter tuning (if model supports tune()).",
+        "--tune-random",
+        dest="tune_mode",
+        action="store_const",
+        const="random",
+        help="Run RandomizedSearchCV tuning (if model supports tune()).",
+    )
+    tune_group.add_argument(
+        "--tune-optuna",
+        dest="tune_mode",
+        action="store_const",
+        const="optuna",
+        help="Run OptunaSearchCV tuning (if model supports tune_optuna()).",
     )
     tune_group.add_argument(
         "--no-tune",
-        dest="tune",
-        action="store_false",
+        dest="tune_mode",
+        action="store_const",
+        const="none",
         help="Skip hyperparameter tuning.",
     )
-    parser.set_defaults(tune=None)
+    tune_group.add_argument(
+        "--params-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a best_params.json file produced by experiments/tune.py. "
+            "When provided, the model's hyperparameters are loaded from this file "
+            "and no in-process tuning is performed. This is the recommended "
+            "MLOps workflow: run tune.py once, then feed its output here."
+        ),
+    )
+    parser.set_defaults(tune_mode="none", params_file=None)
+
     parser.add_argument(
         "--zarr",
         default=None,
@@ -214,6 +250,30 @@ def parse_args() -> argparse.Namespace:
         help="DVC target path to push when --dvc-push is enabled.",
     )
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def _banner(title: str, char: str = "=") -> None:
+    """Print a wide, clearly delimited section banner to stdout."""
+    bar = char * 78
+    print(f"\n[run] {bar}", flush=True)
+    print(f"[run] {title}", flush=True)
+    print(f"[run] {bar}", flush=True)
+
+
+def _fmt_secs(seconds: float) -> str:
+    """Format seconds as a short human-readable string."""
+    s = int(seconds)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{seconds:.2f}s"
 
 
 # ---------------------------------------------------------------------------
@@ -304,87 +364,218 @@ def run(args: argparse.Namespace) -> None:
     results_dir      = args.results_dir        or os.path.join(script_dir, "results")
 
     t0 = time.time()
-    print(f"\n{'='*60}", flush=True)
-    print(f"[run] Experiment  : {experiment_name}", flush=True)
-    print(f"[run] Model       : {getattr(model, 'name', type(model).__name__)}", flush=True)
-    print(f"[run] Threshold   : {threshold}", flush=True)
-    print(f"{'='*60}\n", flush=True)
+    model_name = getattr(model, "name", type(model).__name__)
+    _banner(f"EXPERIMENT: {experiment_name}")
+    print(f"[run] Model            : {model_name}", flush=True)
+    print(f"[run] Model key        : {args.model}", flush=True)
+    print(f"[run] Threshold        : {threshold}", flush=True)
+    print(f"[run] Test size        : {test_size}", flush=True)
+    print(f"[run] Max rows         : {max_rows if max_rows else 'ALL'}", flush=True)
+    print(f"[run] Tune mode        : {args.tune_mode}", flush=True)
+    print(f"[run] Params file      : {args.params_file or '(none)'}", flush=True)
+    print(f"[run] Zarr path        : {zarr_path}", flush=True)
+    print(f"[run] Split file       : {split_file}", flush=True)
+    print(f"[run] Results dir      : {results_dir}", flush=True)
 
     # ------------------------------------------------------------------
     # 1. Load data
     # ------------------------------------------------------------------
+    _banner("STEP 1/6 — Loading data")
+    t_step = time.time()
     records = load_pairs(zarr_file=zarr_path, max_rows=max_rows)
+    print(
+        f"[run] Loaded {len(records):,} pair records in {_fmt_secs(time.time() - t_step)}.",
+        flush=True,
+    )
 
     # ------------------------------------------------------------------
-    # 2. Build features (model owns this step)
+    # 2. Resolve the train/test split BEFORE building features.
+    #
+    #    Models whose featurizers must be fit on training data only
+    #    (e.g. XGBoostClassicalModel) need the split indices available
+    #    at feature-build time.  We extract labels cheaply from the raw
+    #    records to seed stratified splitting without calling build_features
+    #    yet.
+    # ------------------------------------------------------------------
+    _banner("STEP 2/6 — Resolving train/test split (stratified)")
+    t_step = time.time()
+    y_labels = np.array([r.label for r in records], dtype=np.int32)
+    train_idx, test_idx = _get_split(len(records), y_labels, split_file, test_size)
+    print(
+        f"[run] Split ready in {_fmt_secs(time.time() - t_step)} | "
+        f"train={len(train_idx):,} ({100 * len(train_idx) / len(records):.1f}%), "
+        f"test={len(test_idx):,} ({100 * len(test_idx) / len(records):.1f}%) | "
+        f"train_pos={int(y_labels[train_idx].sum()):,}/{len(train_idx):,} "
+        f"({100.0 * y_labels[train_idx].mean():.2f}%), "
+        f"test_pos={int(y_labels[test_idx].sum()):,}/{len(test_idx):,} "
+        f"({100.0 * y_labels[test_idx].mean():.2f}%)",
+        flush=True,
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Build features (model owns this step)
     # ------------------------------------------------------------------
     # Propagate the resolved cross-encoder zarr path into any model that
     # carries a cfg dict with a "cross_encoder_zarr" key (e.g. GRUModelV4).
-    # This mirrors how zarr_path is resolved here and passed to load_pairs(),
-    # keeping all path resolution in one place rather than inside model files.
     if hasattr(model, "cfg") and "cross_encoder_zarr" in model.cfg:
         model.cfg["cross_encoder_zarr"] = cross_enc_path
 
-    print(f"\n[run] Building features with {getattr(model, 'name', type(model).__name__)}...", flush=True)
-    X, y, feature_names = model.build_features(records)
-    print(f"[run] Feature matrix: {X.shape}  labels: {y.shape}", flush=True)
+    _banner(f"STEP 3/6 — Building features ({model_name})")
+    t_step = time.time()
 
-    # ------------------------------------------------------------------
-    # 3. Fixed train/test split (saved on first run, reused thereafter)
-    # ------------------------------------------------------------------
-    train_idx, test_idx = _get_split(len(records), y, split_file, test_size)
+    import inspect as _inspect
+    _bf_sig = _inspect.signature(model.build_features)
+    if "train_idx" in _bf_sig.parameters:
+        # Model supports split-aware build (featurizers fit on train only)
+        print(
+            "[run] Model supports split-aware feature build "
+            "(train_idx passed so featurizers are fit on training data only).",
+            flush=True,
+        )
+        X, y, feature_names = model.build_features(records, train_idx=train_idx)
+    else:
+        print(
+            "[run] Model has no split-aware feature build; featurizers (if any) "
+            "will see all records.",
+            flush=True,
+        )
+        X, y, feature_names = model.build_features(records)
+
+    print(
+        f"[run] Feature build complete in {_fmt_secs(time.time() - t_step)} | "
+        f"X.shape={X.shape}, dtype={X.dtype}, "
+        f"y.shape={y.shape}, n_features={len(feature_names):,}",
+        flush=True,
+    )
 
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
     test_records = [records[i] for i in test_idx]
 
-    print(f"[run] Train: {len(train_idx)}  Test: {len(test_idx)}", flush=True)
+    print(
+        f"[run] Train matrix: X_train={X_train.shape}  "
+        f"Test matrix: X_test={X_test.shape}",
+        flush=True,
+    )
 
     # ------------------------------------------------------------------
-    # 4. Fit
+    # 4. Hyperparameter handling (params-file load or in-process tuning)
     # ------------------------------------------------------------------
-    print(f"\n[run] Fitting model...", flush=True)
-    t_fit = time.time()
-    model_supports_tune = hasattr(model, "tune")
-    if args.tune is None:
-        do_tune = model_supports_tune
-    else:
-        do_tune = bool(args.tune)
+    _banner("STEP 4/6 — Hyperparameter handling")
+    # Load tuned hyperparameters from a JSON file produced by experiments/tune.py.
+    # This is the preferred MLOps workflow: tuning and evaluation are separate
+    # stages. The evaluation run here does NO hyperparameter search of its own —
+    # it just applies the params discovered earlier, then fits and reports.
+    if args.params_file is not None:
+        if not os.path.exists(args.params_file):
+            raise FileNotFoundError(f"--params-file not found: {args.params_file}")
+        with open(args.params_file, "r", encoding="utf-8") as f:
+            payload = json.load(f)
 
-    if do_tune and not model_supports_tune:
+        best_params = payload.get("best_params")
+        if not isinstance(best_params, dict):
+            raise ValueError(
+                f"{args.params_file} does not contain a 'best_params' dict. "
+                "Expected the schema written by experiments/tune.py."
+            )
+        tuned_for = payload.get("model")
+        if tuned_for is not None and tuned_for != args.model:
+            print(
+                f"[run] WARNING: --params-file was produced for model '{tuned_for}', "
+                f"but this run uses '{args.model}'. Params may be incompatible.",
+                flush=True,
+            )
+        if not hasattr(model, "apply_tuned_params"):
+            raise RuntimeError(
+                f"Model '{args.model}' does not implement apply_tuned_params(); "
+                "cannot consume --params-file for this model."
+            )
         print(
-            f"[run] Tuning requested but {getattr(model, 'name', type(model).__name__)} "
-            "does not implement tune(); continuing without tuning.",
+            f"[run] Loading tuned hyperparameters from {args.params_file} "
+            f"(best_score={payload.get('best_score')}, method={payload.get('method')}).",
             flush=True,
         )
-        do_tune = False
-
-    if do_tune:
-        print("[run] Hyperparameter tuning enabled.", flush=True)
-        model.tune(X_train, y_train)
-        model.tune_optuna(X_train, y_train)
+        model.apply_tuned_params(
+            best_params,
+            source=os.path.abspath(args.params_file),
+            cv_score=payload.get("best_score"),
+            method=payload.get("method", "external"),
+        )
+    elif args.tune_mode == "random":
+        if hasattr(model, "tune"):
+            print(
+                "[run] Hyperparameter tuning enabled (RandomizedSearchCV) — "
+                "running in-process tune() on the training matrix …",
+                flush=True,
+            )
+            t_tune = time.time()
+            model.tune(X_train, y_train)
+            print(
+                f"[run] Tuning complete in {_fmt_secs(time.time() - t_tune)}.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[run] RandomizedSearchCV tuning requested but {model_name} "
+                "does not implement tune(); continuing without tuning.",
+                flush=True,
+            )
+    elif args.tune_mode == "optuna":
+        if hasattr(model, "tune_optuna"):
+            print(
+                "[run] Hyperparameter tuning enabled (OptunaSearchCV) — "
+                "running in-process tune_optuna() on the training matrix. "
+                "NOTE: For better MLOps hygiene, prefer running experiments/tune.py "
+                "once and re-using its best_params.json via --params-file.",
+                flush=True,
+            )
+            t_tune = time.time()
+            model.tune_optuna(X_train, y_train)
+            print(
+                f"[run] Tuning complete in {_fmt_secs(time.time() - t_tune)}.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[run] OptunaSearchCV tuning requested but {model_name} "
+                "does not implement tune_optuna(); continuing without tuning.",
+                flush=True,
+            )
     else:
-        print("[run] Hyperparameter tuning skipped.", flush=True)
+        print("[run] Hyperparameter tuning skipped (using model defaults).", flush=True)
 
+    # ------------------------------------------------------------------
+    # 5. Fit
+    # ------------------------------------------------------------------
+    _banner(f"STEP 5/6 — Fitting model ({model_name})")
+    t_fit = time.time()
     model.fit(X_train, y_train)
-    print(f"[run] Fit complete in {time.time() - t_fit:.1f}s", flush=True)
+    print(
+        f"[run] Fit complete in {_fmt_secs(time.time() - t_fit)}.",
+        flush=True,
+    )
 
     # ------------------------------------------------------------------
-    # 5. Predict
+    # 6. Predict + Report
     # ------------------------------------------------------------------
+    _banner("STEP 6/6 — Predicting + generating report")
+    t_pred = time.time()
     proba = model.predict_proba(X_test)
+    print(
+        f"[run] Predict complete in {_fmt_secs(time.time() - t_pred)} "
+        f"(proba.shape={proba.shape})",
+        flush=True,
+    )
 
-    # ------------------------------------------------------------------
-    # 6. Report
-    # ------------------------------------------------------------------
-    print(f"\n[run] Generating report...", flush=True)
+    print(f"[run] Generating report …", flush=True)
     cli_args_dict = {
         "model":       args.model,
         "name":        args.name,
         "max_rows":    args.max_rows,
         "test_size":   args.test_size,
         "threshold":   args.threshold,
-        "tune":        args.tune,
+        "tune_mode":   args.tune_mode,
+        "params_file": os.path.abspath(args.params_file) if args.params_file else None,
         "zarr":               zarr_path,
         "cross_encoder_zarr": cross_enc_path,
         "split_file":         split_file,
@@ -392,6 +583,7 @@ def run(args: argparse.Namespace) -> None:
         "dvc_push":    args.dvc_push,
         "dvc_push_target": args.dvc_push_target,
     }
+
     generate_report(
         experiment_name=experiment_name,
         y_true=y_test,
@@ -402,6 +594,7 @@ def run(args: argparse.Namespace) -> None:
         threshold=threshold,
         results_dir=results_dir,
         cli_args=cli_args_dict,
+        tune_mode=args.tune_mode
     )
 
     _maybe_dvc_push(
@@ -410,7 +603,7 @@ def run(args: argparse.Namespace) -> None:
         target=args.dvc_push_target,
     )
 
-    print(f"\n[run] Total wall time: {time.time() - t0:.1f}s", flush=True)
+    _banner(f"DONE — '{experiment_name}' finished in {_fmt_secs(time.time() - t0)}")
 
 
 if __name__ == "__main__":

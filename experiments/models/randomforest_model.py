@@ -61,6 +61,7 @@ class RandomForestModel:
         self._model = RandomForestClassifier(**params)
         self._dims = matryoshka_dims
         self._params = params
+        self._last_tuner = None
         self._tuning_info: dict[str, object] = {
             "enabled": False,
         }
@@ -104,6 +105,7 @@ class RandomForestModel:
         print("Best hyperparameters:", best_params)
         self._params.update(best_params)
         self._model.set_params(**best_params)
+        self._last_tuner = tuner
         self._tuning_info = {
             "enabled": True,
             "method": "RandomizedSearchCV",
@@ -123,6 +125,9 @@ class RandomForestModel:
     def feature_importances(self) -> dict[str, float]:
         importances = self._model.feature_importances_
         return dict(zip(self._feature_names, importances.tolist()))
+
+    def get_tuner(self):
+        return self._last_tuner
 
     # =========================
     # Config for reporting

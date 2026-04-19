@@ -7,6 +7,7 @@ load_dotenv()  # loads KAGGLE_USERNAME and KAGGLE_KEY from .env
 
 import kagglehub
 import numpy as np
+import torch
 import zarr
 from sentence_transformers import CrossEncoder
 
@@ -99,6 +100,31 @@ print(f"[INFO] Total question pairs to encode: {N}", flush=True)
 print(f"[INFO] Loading cross-encoder model: {MODEL_NAME}", flush=True)
 model = CrossEncoder(MODEL_NAME)
 
+# Access the underlying HuggingFace model and tokenizer so we can run a
+# single forward pass that yields BOTH the scalar relevance score AND the
+# full CLS-token hidden-state embedding.
+auto_model = model.model       # AutoModelForSequenceClassification
+tokenizer  = model.tokenizer
+
+device = next(auto_model.parameters()).device
+print(f"[INFO] Model device: {device}", flush=True)
+
+# Determine hidden size with a tiny dummy forward pass.
+with torch.no_grad():
+    _dummy_enc = tokenizer(
+        [("probe", "probe")],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=8,
+    )
+    _dummy_enc = {k: v.to(device) for k, v in _dummy_enc.items()}
+    _dummy_out = auto_model(**_dummy_enc, output_hidden_states=True)
+    hidden_size: int = _dummy_out.hidden_states[-1].shape[-1]
+    del _dummy_enc, _dummy_out
+
+print(f"[INFO] Cross-encoder hidden size: {hidden_size}", flush=True)
+
 # ---------------------------------------------------------------------------
 # Open zarr store
 # ---------------------------------------------------------------------------
@@ -120,13 +146,23 @@ qid1_arr[:] = np.array(qid1s, dtype=np.int64)
 qid2_arr = store.zeros(name="qid2", shape=(N,), dtype="int64", chunks=(BATCH_SIZE,))
 qid2_arr[:] = np.array(qid2s, dtype=np.int64)
 
-# cross_encoder_score array — will be filled in batches
+# cross_encoder_score: scalar sigmoid probability — kept for backwards compat
 score_arr = store.full(
     name="cross_encoder_score",
     shape=(N,),
     fill_value=float("nan"),
     dtype="float32",
     chunks=(BATCH_SIZE,),
+)
+
+# cross_encoder_features: CLS-token hidden state from the final layer.
+# Shape (N, hidden_size).  This is the rich, multi-dimensional CE output
+# that gru_model_v4 appends to its scalar bridge instead of the single score.
+features_arr = store.zeros(
+    name="cross_encoder_features",
+    shape=(N, hidden_size),
+    dtype="float32",
+    chunks=(BATCH_SIZE, hidden_size),
 )
 
 # ---------------------------------------------------------------------------
@@ -142,13 +178,33 @@ last_log_time = score_start
 
 for i in range(0, N, BATCH_SIZE):
     batch = pairs[i : i + BATCH_SIZE]
-    scores = model.predict(batch, show_progress_bar=False)
-    # scores is a numpy array of shape (batch_size,)
-    score_arr[i : i + len(batch)] = scores.astype(np.float32)
+    texts = [(q1, q2) for q1, q2 in batch]
+
+    encoded = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=512,
+        return_tensors="pt",
+    )
+    encoded = {k: v.to(device) for k, v in encoded.items()}
+
+    with torch.no_grad():
+        outputs = auto_model(**encoded, output_hidden_states=True)
+
+    # CLS token from the last hidden layer → (batch, hidden_size)
+    cls_emb = outputs.hidden_states[-1][:, 0, :].cpu().float().numpy()
+
+    # Scalar relevance score: sigmoid of the classification logit → (batch,)
+    scores = torch.sigmoid(outputs.logits.squeeze(-1)).cpu().float().numpy()
+
+    batch_len = len(batch)
+    features_arr[i : i + batch_len] = cls_emb
+    score_arr[i : i + batch_len]    = scores
 
     now = time.time()
     elapsed = now - score_start
-    done = i + len(batch)
+    done = i + batch_len
     pct  = done / N * 100
     rate = done / elapsed if elapsed > 0 else 0
     eta  = (N - done) / rate if rate > 0 else 0
@@ -173,14 +229,17 @@ print(
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-print(f"\nSaved {N} cross-encoder scores to {OUTPUT_FILE}")
-print(f"  store['index']               shape: {store['index'].shape}")
-print(f"  store['qid1']                shape: {store['qid1'].shape}")
-print(f"  store['qid2']                shape: {store['qid2'].shape}")
-print(f"  store['cross_encoder_score'] shape: {store['cross_encoder_score'].shape}")
+print(f"\nSaved {N} cross-encoder outputs to {OUTPUT_FILE}")
+print(f"  store['index']                 shape: {store['index'].shape}")
+print(f"  store['qid1']                  shape: {store['qid1'].shape}")
+print(f"  store['qid2']                  shape: {store['qid2'].shape}")
+print(f"  store['cross_encoder_score']   shape: {store['cross_encoder_score'].shape}")
+print(f"  store['cross_encoder_features'] shape: {store['cross_encoder_features'].shape}")
 print()
 print("Example lookup — first pair:")
-print(f"  index              : {store['index'][0]}")
-print(f"  qid1               : {store['qid1'][0]}")
-print(f"  qid2               : {store['qid2'][0]}")
-print(f"  cross_encoder_score: {store['cross_encoder_score'][0]:.6f}")
+print(f"  index                  : {store['index'][0]}")
+print(f"  qid1                   : {store['qid1'][0]}")
+print(f"  qid2                   : {store['qid2'][0]}")
+print(f"  cross_encoder_score    : {store['cross_encoder_score'][0]:.6f}")
+print(f"  cross_encoder_features : shape={store['cross_encoder_features'][0].shape}  "
+      f"norm={np.linalg.norm(store['cross_encoder_features'][0]):.4f}")
