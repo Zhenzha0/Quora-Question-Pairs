@@ -251,6 +251,32 @@ def run(args: argparse.Namespace) -> None:
             )
     print(f"[tune] Saved tuning summary to {summary_path}", flush=True)
 
+    # ------------------------------------------------------------------
+    # 4. Save Optuna visualisations (HTML, open in browser)
+    # ------------------------------------------------------------------
+    plots_dir = os.path.join(out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    try:
+        import optuna.visualization as vis
+
+        vis.plot_optimization_history(study).write_html(
+            os.path.join(plots_dir, "optimization_history.html")
+        )
+        vis.plot_param_importances(study).write_html(
+            os.path.join(plots_dir, "param_importances.html")
+        )
+        vis.plot_parallel_coordinate(study).write_html(
+            os.path.join(plots_dir, "parallel_coordinates.html")
+        )
+        for param in SEARCH_SPACE.keys():
+            vis.plot_slice(study, params=[param]).write_html(
+                os.path.join(plots_dir, f"slice_{param}.html")
+            )
+        print(f"[tune] Saved visualisations to {plots_dir}", flush=True)
+    except Exception as e:
+        print(f"[tune] Visualisations failed (non-fatal): {e}", flush=True)
+
 
 if __name__ == "__main__":
     run(parse_args())
