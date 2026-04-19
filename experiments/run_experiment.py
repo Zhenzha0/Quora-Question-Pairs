@@ -84,22 +84,6 @@ MODEL_REGISTRY: dict[str, object] = {
     "gru_v3": GRUModelV3(),
     "gru_v4": GRUModelV4(),
     "lstm":   LSTMModel(),
-    "lstm_tuned": LSTMModel(
-        hidden_size  = 256,
-        num_layers   = 2,
-        dropout      = 0.1079232903114802,
-        lr           = 0.001320862780290983,
-        weight_decay = 0.00015926060604766042135,
-        mlp_hidden   = 512,
-    ),
-    "gru_v3_tuned": GRUModelV3(
-        hidden_size  = 512,
-        num_layers   = 3,
-        dropout      = 0.18493564427131048,
-        lr           = 0.00023102018878452950,
-        weight_decay = 3.549878832196503e-05,
-        mlp_hidden   = 512,
-    ),
     # ------------------------------------------------------------------
     # Ensemble models
     # ------------------------------------------------------------------
