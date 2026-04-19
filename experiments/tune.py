@@ -340,6 +340,30 @@ def main() -> None:
             "Re-run with --resume (default) to continue, or delete the file to start fresh."
         )
 
+    _study_exists = os.path.exists(storage_path)
+    if _study_exists:
+        # Peek at the trial count before loading so we can report it.
+        _peek = optuna.load_study(
+            study_name=args.name,
+            storage=storage_url,
+        )
+        _n_done = len([t for t in _peek.trials
+                       if t.state == optuna.trial.TrialState.COMPLETE])
+        _n_total = len(_peek.trials)
+        print(
+            f"[tune] RESUMING existing study '{args.name}' "
+            f"({_n_done} complete / {_n_total} total trials so far). "
+            f"Storage: {storage_path}",
+            flush=True,
+        )
+        del _peek
+    else:
+        print(
+            f"[tune] Starting FRESH study '{args.name}'. "
+            f"Storage will be created at: {storage_path}",
+            flush=True,
+        )
+
     study = optuna.create_study(
         study_name=args.name,
         storage=storage_url,
