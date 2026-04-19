@@ -67,7 +67,8 @@ _DEFAULTS = dict(
     reg_alpha=1.0,
     objective="binary:logistic",
     eval_metric="logloss",
-    tree_method="gpu_hist",
+    tree_method="hist",
+    device = "cuda",
     random_state=42,
     n_jobs=-1,
 )
